@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup: venv + requirements",
+      "type": "shell",
+      "options": { "cwd": "${workspaceFolder}" },
+      "command": "pwsh",
+      "args": [
+        "-NoProfile",
+        "-Command",
+        "if (-not (Test-Path ./.env) -and (Test-Path ./.env.example)) { Copy-Item ./.env.example ./.env -Force }; if (-not (Test-Path ./.venv/Scripts/python.exe) -and -not (Test-Path ./.venv_build/Scripts/python.exe)) { if (Get-Command py -ErrorAction SilentlyContinue) { py -3 -m venv ./.venv } else { python -m venv ./.venv } }; $py = (Test-Path ./.venv_build/Scripts/python.exe) ? './.venv_build/Scripts/python.exe' : './.venv/Scripts/python.exe'; & $py -m pip install --upgrade pip; & $py -m pip install -r requirements.txt"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

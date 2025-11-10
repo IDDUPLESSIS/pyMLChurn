@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run pyMLChurn.py",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/pyMLChurn.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true,
+      "args": [],
+      "preLaunchTask": "Setup: venv + requirements"
+    },
+    {
+      "name": "Module: pymlchurn.cli",
+      "type": "python",
+      "request": "launch",
+      "module": "pymlchurn.cli",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": true,
+      "args": [],
+      "preLaunchTask": "Setup: venv + requirements"
+    }
+  ]
+}

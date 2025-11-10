@@ -1,0 +1,21 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.venv_build/
+.state/
+.env
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.log
+*.tmp
+*.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Data outputs
+*.csv
