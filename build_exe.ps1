@@ -1,4 +1,4 @@
-Param(
+﻿Param(
   [switch]$OneFile = $false,
   [string]$Name = 'pyMLChurn'
 )
@@ -24,7 +24,9 @@ $args = @('--name', $Name, 'pyMLChurn.py')
 if ($OneFile) { $args = @('--onefile') + $args } else { $args = @('--onedir') + $args }
 
 Write-Host "[build] Running PyInstaller $($args -join ' ')"
-& $py -m PyInstaller @args
+& $py -m PyInstaller --hidden-import importlib.resources --collect-submodules sklearn --collect-submodules scipy --collect-data scipy @args
 
 Write-Host "[build] Done. Executable is under: dist\\$Name\\$Name.exe"
+
+
 

@@ -20,12 +20,12 @@ import time
 from datetime import datetime
 from typing import Optional
 import sys
+from dotenv import find_dotenv
 
 from pymlchurn.config import Config
 from pymlchurn.db import query_dataframe, pick_driver, connectivity_info
 from pymlchurn.sp_runner import maybe_run_sp, SPRunPolicy
 from pymlchurn.query import churn_query, feature_columns, target_column, CUSTOMER_ID_COL, DATE_COL
-from pymlchurn.ml import MLConfig, train_and_predict
 from pymlchurn.load_sql import create_table_if_missing, load_dataframe
 
 
@@ -46,7 +46,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--load-sql", action="store_true", help="Create table if missing and load predictions to SQL")
     p.add_argument("--load-schema", type=str, default="dbo", help="Target schema for SQL load (default: dbo)")
     p.add_argument("--load-table", type=str, default="CustomerChurnPredictions", help="Target table name for SQL load")
-    p.add_argument("--load-if-exists", choices=["append","replace","fail"], default="append", help="Behavior if table exists (default: append)")
+    p.add_argument("--load-if-exists", choices=["append","replace","fail"], default="replace", help="Behavior if table exists (default: replace)")
     p.add_argument("--keep-csv", action="store_true", help="Keep generated CSV files (default: delete after run)")
     p.add_argument("--auth", choices=["windows", "sql"], default=None, help="Override MSSQL_AUTH")
     p.add_argument("--username", type=str, default=None, help="SQL login username (if --auth sql)")
@@ -89,11 +89,84 @@ def build_config(args: argparse.Namespace) -> Config:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # Set up a persistent log file next to the EXE when frozen,
+    # otherwise use the current working directory
+    try:
+        if getattr(sys, 'frozen', False):
+            log_dir = Path(sys.executable).resolve().parent
+        else:
+            log_dir = Path.cwd()
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log_dir = Path.cwd()
+    log_file = str(log_dir / f"pyMLChurn_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    # Tee stdout/stderr to the log file to capture all prints
+    try:
+        class _Tee:
+            def __init__(self, primary, fh):
+                self.primary = primary
+                self.fh = fh
+            def write(self, s):
+                try:
+                    if self.primary:
+                        self.primary.write(s)
+                except Exception:
+                    pass
+                try:
+                    self.fh.write(s)
+                except Exception:
+                    pass
+            def flush(self):
+                try:
+                    if self.primary:
+                        self.primary.flush()
+                except Exception:
+                    pass
+                try:
+                    self.fh.flush()
+                except Exception:
+                    pass
+        _fh = open(log_file, 'a', encoding='utf-8', buffering=1)
+        _orig_out, _orig_err = sys.stdout, sys.stderr
+        sys.stdout = _Tee(_orig_out, _fh)
+        sys.stderr = _Tee(_orig_err, _fh)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Logging initialized -> {log_file}")
+    except Exception:
+        pass
     def ts() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def log(msg: str) -> None:
-        print(f"[{ts()}] {msg}")
+        nonlocal log_file
+        line = f"[{ts()}] {msg}"
+        print(line)
+        # Attempt primary log; on failure, fall back to Documents
+        wrote = False
+        try:
+            if log_file:
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+                wrote = True
+        except Exception:
+            wrote = False
+        if not wrote:
+            try:
+                fallback_dir = Path.home() / "Documents" / "pyMLChurn"
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                fb = str(fallback_dir / f"pyMLChurn_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+                with open(fb, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+                log_file = fb
+            except Exception:
+                pass
+        # Keep a simple rolling latest log next to the chosen log directory
+        try:
+            latest = Path(log_file).with_name("pyMLChurn_latest.log") if log_file else None
+            if latest:
+                with open(latest, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
 
     args = parse_args(argv)
     # If running as frozen EXE with no args, default to SQL load and ephemeral CSVs
@@ -105,13 +178,31 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.output = "predictions_auto.csv"
             args.raw_output = None
             args.keep_csv = False
+            args.load_if_exists = 'replace'
+            # Ensure working directory finds .env
+            env_path = find_dotenv(usecwd=True)
+            if not env_path:
+                exe_dir = Path(sys.executable).resolve().parent
+                for candidate in [exe_dir / ".env", exe_dir.parent / ".env", exe_dir.parent.parent / ".env"]:
+                    if candidate.exists():
+                        env_path = str(candidate)
+                        break
+            if env_path:
+                os.chdir(str(Path(env_path).parent))
     except Exception:
         pass
-    cfg = build_config(args)
+    try:
+        cfg = build_config(args)
+    except Exception as e:
+        log(f"ERROR loading configuration: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 2
 
     # Surface the driver choice so it is visible in this script's output
     chosen_driver = pick_driver(cfg.odbc_driver)
     log(f"Using ODBC driver: {chosen_driver}")
+    log(f"Logs: {log_file}")
 
     if args.check or args.check_only:
         log("Running connectivity check...")
@@ -138,7 +229,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     sql = churn_query(args.top, include_label=True, target=args.target_col)
     log("Running main query...")
     _t0 = time.perf_counter()
-    df = query_dataframe(cfg, sql)
+    try:
+        df = query_dataframe(cfg, sql)
+    except Exception as e:
+        log(f"ERROR running query: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 3
     log(f"Query returned {len(df):,} rows in {time.perf_counter()-_t0:.1f}s")
 
     # Normalize and optionally filter/deduplicate by date
@@ -167,8 +264,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Train and predict
     log("Training model and generating predictions...")
     _t0 = time.perf_counter()
-    ml_cfg = MLConfig(customer_id_col=CUSTOMER_ID_COL, feature_cols=feature_columns(), target_col=args.target_col, date_col=DATE_COL)
-    pred_df = train_and_predict(df, ml_cfg)
+    try:
+        from pymlchurn.ml import MLConfig, train_and_predict
+        ml_cfg = MLConfig(customer_id_col=CUSTOMER_ID_COL, feature_cols=feature_columns(), target_col=args.target_col, date_col=DATE_COL)
+        pred_df = train_and_predict(df, ml_cfg)
+    except Exception as e:
+        log(f"ERROR during model/predictions: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 4
     log(f"Model + predictions completed in {time.perf_counter()-_t0:.1f}s")
 
     # Drop legacy columns if present
@@ -305,10 +409,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.load_sql:
         log(f"Loading into SQL: [{args.load_schema}].[{args.load_table}] (if_exists={args.load_if_exists})...")
         _t0 = time.perf_counter()
-        fq, dtypes = create_table_if_missing(cfg, pred_df, args.load_schema, args.load_table)
-        load_dataframe(cfg, pred_df, args.load_schema, args.load_table, if_exists=args.load_if_exists)
-        print(f"Loaded {len(pred_df):,} rows into {fq}")
-        log(f"SQL load completed in {time.perf_counter()-_t0:.1f}s")
+        try:
+            fq, dtypes = create_table_if_missing(cfg, pred_df, args.load_schema, args.load_table)
+            load_dataframe(cfg, pred_df, args.load_schema, args.load_table, if_exists=args.load_if_exists)
+            print(f"Loaded {len(pred_df):,} rows into {fq}")
+            log(f"SQL load completed in {time.perf_counter()-_t0:.1f}s")
+        except Exception as e:
+            log(f"ERROR loading to SQL: {e}")
+            if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+                time.sleep(8)
+            return 5
     # Cleanup generated CSVs unless requested to keep
     if not args.keep_csv:
         log("Cleaning up generated CSV files...")
@@ -326,6 +436,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             log("Could not remove some files (may be open):")
             for fp, err in failed:
                 print(f"  {fp}: {err}")
+    if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+        log("Run complete. Closing in 5 seconds...")
+        time.sleep(5)
     return 0
 
 

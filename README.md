@@ -10,7 +10,8 @@ Quick Start
 - Run once and keep CSVs:
   - `python pyMLChurn.py --output predictions.csv --raw-output raw.csv --keep-csv`
 - Load into SQL (same run):
-  - `python pyMLChurn.py --output predictions.csv --load-sql --load-if-exists append --keep-csv`
+  - `python pyMLChurn.py --output predictions.csv --load-sql --keep-csv`
+  - Default load mode is replace; use `--load-if-exists append` to append instead
 - Build EXE (optional): `.\build_exe.ps1`, then double‑click `dist\pyMLChurn\pyMLChurn.exe` (auto loads to SQL)
 
 Requirements
@@ -37,8 +38,11 @@ Run
   - `run_pyMLChurn.ps1` or `run_pyMLChurn.bat` (auto-creates venv, installs deps, runs)
 
 Double‑click EXE
-- The EXE auto‑loads predictions to SQL when run with no flags and searches for `.env` next to the EXE or in the repo root.
-- To keep CSVs when running from a terminal: add `--keep-csv`.
+- The EXE auto‑loads predictions to SQL when run with no flags and searches for `.env` next to the EXE or in the repo root
+- Default SQL load mode is replace (overwrites `[dbo].[CustomerChurnPredictions]` on each run)
+- Logs: `pyMLChurn_latest.log` and timestamped `pyMLChurn_run_*.log` are written next to the EXE
+- To keep CSVs when running from a terminal: add `--keep-csv`
+- Debug runner: `run_exe_debug.bat` captures console output to `dist\pyMLChurn\pyMLChurn_win_stdout_stderr.txt`
 
 Connection and refresh
 - Pre-query stored procedure: runs `[dbo].[sp_build_customer_churn_cadence_v1]` once per 24h
@@ -67,10 +71,11 @@ Output columns
   - Churn Probability % (Next 90 Days)
   - Churn Probability (Next 90 Days)
   - Why At Risk (Predicted)
+  - CreatedOn (timestamp)
 - Technical headers: `--headers technical`
   - `customer_id`, `as_of_date_t0`, `actual_churned_90d_t0+90d`, `actual_churn_reason_t0`,
     `predicted_churn_90d_t0+90d`, `predicted_churn_probability_90d_t0+90d`,
-    `predicted_churn_probability_90d_pct_t0+90d`, `predicted_churn_reason_t0`
+    `predicted_churn_probability_90d_pct_t0+90d`, `predicted_churn_reason_t0`, `CreatedOn`
 
 Common flags
 - `--raw-output raw.csv` save the raw query rows used by the model
@@ -108,3 +113,65 @@ Feature glossary (units)
 
 Contributing
 - See `CONTRIBUTING.md` for a short guide to setting up a dev environment and proposing changes.
+
+Troubleshooting
+- .env not found
+  - Python: place `.env` in the repo root
+  - EXE (double‑click): place `.env` either next to the EXE (`dist\pyMLChurn\.env`) or in the repo root — the EXE searches both and will chdir into the folder containing `.env`
+  - Minimum keys: `MSSQL_SERVER`, `MSSQL_DATABASE`, `MSSQL_AUTH` (windows or sql). For SQL auth, also set `MSSQL_USERNAME` and `MSSQL_PASSWORD`
+  - Certificates: keep `MSSQL_ENCRYPT=yes`. If you have an internal/self‑signed cert, set `MSSQL_TRUST_CERT=yes`
+- ODBC driver missing
+  - Install Microsoft ODBC Driver 18 or 17 for SQL Server. If both exist, you can pin with `MSSQL_ODBC_DRIVER="ODBC Driver 17 for SQL Server"`
+- No console when double‑clicking the EXE
+  - Logs are written next to the EXE: `pyMLChurn_latest.log` and timestamped `pyMLChurn_run_*.log`
+  - Use `run_exe_debug.bat` to capture all console output into `dist\pyMLChurn\pyMLChurn_win_stdout_stderr.txt`
+- Stored procedure runs too long
+  - Add `--skip-sp` to skip the pre‑query stored procedure, or reduce its TTL via `--sp-ttl-hours`
+- Table not updated / wrong DB
+  - Default table: `[dbo].[CustomerChurnPredictions]` in the database from your `.env`
+  - Default load mode is replace (overwrites). To append, pass `--load-if-exists append`
+  - Verify with:
+    - `SELECT COUNT(*) FROM [dbo].[CustomerChurnPredictions];`
+    - `SELECT MAX(CreatedOn) FROM [dbo].[CustomerChurnPredictions];`
+- Connection timeouts (08001)
+  - Verify server and port in `.env` (`MSSQL_SERVER=host,port`)
+  - Ensure the port is reachable and remote connections are allowed
+  - If you have proper CA‑signed certs, consider `MSSQL_TRUST_CERT=no`
+- Packaging errors with the EXE (SciPy/sklearn)
+  - The EXE bundles `importlib.resources`, sklearn, scipy submodules, and SciPy data
+  - If you still hit import errors, rebuild via `build_exe.ps1` (it uses the correct flags)
+
+Project Structure
+- `pyMLChurn.py` main script and CLI (friendly headers, logging, SQL load)
+- `pymlchurn/`
+  - `config.py` reads `.env` and builds connection config (with EXE‑friendly search)
+  - `db.py` ODBC/SQLAlchemy engine, retries, SP execution, query helpers
+  - `query.py` selected columns + date handling for the churn dataset
+  - `ml.py` model pipeline (LogisticRegression) + SHAP‑based explanations
+  - `sp_runner.py` once‑per‑day SP guard
+  - `load_sql.py` table creation and DataFrame loader (SQLAlchemy to_sql)
+- `run_pyMLChurn.ps1` / `run_pyMLChurn.bat` one‑click runners for Python
+- `build_exe.ps1` builds EXE (bundles sklearn/scipy + importlib.resources)
+- `run_exe_debug.bat` runs EXE and captures console output to a text file
+- `.vscode/` debug/run tasks for VS Code
+- `requirements.txt`, `README.md`, `CONTRIBUTING.md`, `.env.example`, `.gitignore`
+
+Release Checklist
+- Preflight
+  - Verify `.env` is correct locally; ensure `.env` is not committed
+  - Confirm ODBC Driver 17/18 installed and accessible
+  - Smoke test Python run: `python pyMLChurn.py --check-only`
+  - Full test with SQL load (replace):
+    - `python pyMLChurn.py --load-sql --skip-sp --keep-csv`
+    - Check `[dbo].[CustomerChurnPredictions]` row count and `MAX(CreatedOn)`
+- Build EXE
+  - `./build_exe.ps1` (produces `dist/pyMLChurn/pyMLChurn.exe`)
+  - Double‑click EXE; verify logs (`pyMLChurn_latest.log`) and SQL load
+  - Optional: `run_exe_debug.bat` to capture console to text
+- Repo hygiene
+  - Ensure `dist/`, `build/`, `*.spec`, `*.csv`, `.venv_build/`, `.state/` are git‑ignored
+  - Update `README.md` and `CONTRIBUTING.md` if behavior changed
+- Publish
+  - Commit and push to `main`
+  - Create a GitHub release with short notes and (optional) EXE attached
+  - Share the repo link (README contains Quick Start + Troubleshooting)
