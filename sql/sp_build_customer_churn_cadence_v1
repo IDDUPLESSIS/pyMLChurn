@@ -1,0 +1,757 @@
+USE [SAP]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_build_customer_churn_cadence_v1]    Script Date: 11/11/2025 8:58:59 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+/*
+================================================================================
+Procedure: dbo.sp_build_customer_churn_cadence_v1
+
+Purpose
+-------
+Builds a monthly, cadence-aware churn snapshot per (customer_id, t0), writes it
+to dbo.CustomerChurnCadence_v1 (TRUNCATE + INSERT), and optionally returns rows.
+
+What the proc does (high level)
+-------------------------------
+1) Sources
+   - Invoices: SAP.dbo.ZSD_REPBILL  → positive/negative signed net values.
+   - Orders:   SAP.dbo.ZSD_REPORD_ORDER_INTAKE → planned revenue normalized
+     to POSITIVE for sales (report convention is negative; we flip sign).
+
+2) Snapshots (t0)
+   - Creates one t0 per customer per calendar month with activity from invoices
+     OR orders: t0 = first day of that month.
+
+3) Core features at (customer_id, t0)
+   - Recency: days since last positive posted invoice strictly before t0.
+   - Cadence stats from non-zero inter-purchase gaps within a lookback window:
+       * median_gap_days, p90_gap_days, coefficient of variation (cv_gap).
+   - Renewal awareness: flags if t0 is within ±@GraceDays of contract start/end.
+   - Revenue windows (lookback): rev_180d, returns_90d, invoices_90d, credits_90d.
+   - Pipeline proxies: orders_pos_30d / orders_neg_30d (planned revenue),
+     backorder_qty_30d (qty created within prior 30 days).
+   - Trend signals (lookback): pct_change_3m, pct_change_6m, yoy_change_pct.
+   - Credit-note diagnostics: credit_notes_prev_month, invoices_pos_prev_month,
+     credit_notes_ma3 (= 3-month moving avg of credit note counts).
+
+4) Maintenance vs Technology mix & cadence
+   - Heuristic by order number length: LEN=8 → maintenance, LEN=6 → technology.
+   - Maintenance cycle is inferred from pay terms (monthly/quarterly/annual)
+     or from invoice gap median when terms absent.
+   - Maintenance-heavy flag if maint_orders_180d ≥ tech_orders_180d and > 0.
+
+5) Labels
+   - churned_hard90: 1 if NO positive posted invoice in the 90 days AFTER t0.
+   - churned_dynamic: 1 if recency_days > threshold_days, where threshold_days:
+       * Maintenance-heavy → round(1.2 × maint_cycle_days) + renewal grace.
+       * Otherwise → max(p90_gap_days, @K_Mult × median_gap_days) + grace if any.
+       * Global floor: @MinThresholdDays.
+
+6) Human-readable reasons
+   - churn_reason_dynamic / churn_reason_code_dynamic explain why a row is
+     flagged (e.g., RECENCY_GT_XXD | NO_INV_90D | RETURNS_90D | SPEND_DOWN(...)).
+   - churn_reason_hard90 explains the hard-90 label when applicable.
+
+7) Severity score (0–100)
+   - Rank-ordering signal within the churned cohort, combining:
+       * lateness_component     = sigmoid( (recency - threshold) / threshold ).
+       * credits_component      = clamp( returns_90d / |rev_180d|, 0..1 ).
+       * trend_component        = additive penalties for ≤ −30% drops on 3m/6m/YoY.
+       * mitigator_component    = positive evidence (orders_pos_30d>0, renewal_grace)
+                                  reduces severity.
+     Raw score = 0.6*lateness + 0.2*credits + 0.2*trend − 0.15*mitigator,
+     then clamped to [0,1] and scaled to 0–100.
+
+Key Parameters
+--------------
+@LookbackMonths    INT   (default 24)  : history window for gap stats.
+@MinThresholdDays  INT   (default 14)  : global floor for threshold_days.
+@K_Mult            FLOAT (default 2.0) : multiplier for median gap when non-maint.
+@GraceDays         INT   (default 30)  : renewal grace added to threshold.
+@ReturnRows        BIT   (default 1)   : 1 = SELECT final table at the end.
+
+Output table: dbo.CustomerChurnCadence_v1
+-----------------------------------------
+- PK (customer_id, t0)
+- Core fields: recency_days, median_gap_days, p90_gap_days, cv_gap,
+  in_renewal_grace, rev_180d, rev_returns_90d, invoices_90d, credit_notes_90d,
+  orders_pos_30d, orders_neg_30d, backorder_qty_30d,
+  pct_change_3m, pct_change_6m, yoy_change_pct,
+  credit_notes_prev_month, invoices_pos_prev_month, credit_notes_ma3,
+  churned_hard90, threshold_days, churned_dynamic,
+  is_maintenance_heavy, maint_cycle_days,
+  churn_reason_dynamic, churn_reason_code_dynamic, churn_reason_hard90,
+  severity_score + component breakdown (lateness/credits/trend/mitigator).
+
+Performance notes
+-----------------
+- Uses temp tables with covering indexes for large joins and window calcs.
+- PERCENTILE_CONT on gaps is scoped by (customer_id, t0) using prefiltered
+  #gaps_t0 to minimize rows.
+- Final TRUNCATE + INSERT pattern keeps target table slim and contiguous.
+- Indexed common filters (churned_dynamic, t0, severity_score) for downstream use.
+
+Assumptions & conventions
+-------------------------
+- Invoices: positive values indicate posted revenue; negatives are credit notes.
+- Orders: planned revenue normalized to positive (report shows it as negative).
+- Dates: t0 is first day of month; all lookbacks are relative to t0.
+- Entity grain: Sold-To as customer_id.
+
+Usage
+-----
+EXEC dbo.sp_build_customer_churn_cadence_v1;                   -- defaults
+EXEC dbo.sp_build_customer_churn_cadence_v1 @ReturnRows = 0;   -- just populate
+EXEC dbo.sp_build_customer_churn_cadence_v1 @K_Mult=2.5, @GraceDays=21;
+
+Change control
+--------------
+- Adds severity_score and component columns if missing.
+- Safe to re-run; always truncates and reloads dbo.CustomerChurnCadence_v1.
+
+================================================================================
+*/
+
+
+CREATE PROCEDURE [dbo].[sp_build_customer_churn_cadence_v1]
+  @LookbackMonths   INT   = 24,
+  @MinThresholdDays INT   = 14,
+  @K_Mult           FLOAT = 2.0,
+  @GraceDays        INT   = 30,
+  @ReturnRows       BIT   = 1
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SET XACT_ABORT ON;
+
+  /* Ensure target table */
+  IF OBJECT_ID('dbo.CustomerChurnCadence_v1','U') IS NULL
+  BEGIN
+    CREATE TABLE dbo.CustomerChurnCadence_v1
+    (
+      customer_id                bigint         NOT NULL,
+      t0                         date           NOT NULL,
+      recency_days               int            NULL,
+      median_gap_days            int            NULL,
+      p90_gap_days               int            NULL,
+      cv_gap                     float          NULL,
+      in_renewal_grace           bit            NULL,
+      rev_180d                   decimal(18,2)  NULL,
+      rev_returns_90d            decimal(18,2)  NULL,
+      invoices_90d               bigint         NULL,
+      credit_notes_90d           bigint         NULL,
+      orders_pos_30d             decimal(18,2)  NULL,
+      orders_neg_30d             decimal(18,2)  NULL,
+      backorder_qty_30d          float          NULL,
+      pct_change_3m              float          NULL,
+      pct_change_6m              float          NULL,
+      yoy_change_pct             float          NULL,
+      credit_notes_prev_month    int            NULL,
+      invoices_pos_prev_month    int            NULL,
+      credit_notes_ma3           float          NULL,
+      churned_hard90             bit            NOT NULL,
+      threshold_days             int            NULL,
+      churned_dynamic            bit            NOT NULL,
+      is_maintenance_heavy       bit            NULL,
+      maint_cycle_days           int            NULL,
+      churn_reason_dynamic       nvarchar(4000) NULL,
+      churn_reason_code_dynamic  nvarchar(1000) NULL,
+      churn_reason_hard90        nvarchar(200)  NULL,
+      severity_score             float          NULL,
+      lateness_component         float          NULL,
+      credits_component          float          NULL,
+      trend_component            float          NULL,
+      mitigator_component        float          NULL,
+      CONSTRAINT PK_CustomerChurnCadence_v1 PRIMARY KEY CLUSTERED (customer_id, t0)
+    );
+
+    CREATE NONCLUSTERED INDEX IX_CCC_v1_churn_dynamic
+      ON dbo.CustomerChurnCadence_v1 (churned_dynamic, t0)
+      INCLUDE (recency_days, threshold_days, severity_score, customer_id);
+
+    CREATE NONCLUSTERED INDEX IX_CCC_v1_severity
+      ON dbo.CustomerChurnCadence_v1 (severity_score DESC, t0)
+      INCLUDE (customer_id, recency_days, threshold_days, churned_dynamic);
+
+    CREATE NONCLUSTERED INDEX IX_CCC_v1_churn_hard90
+      ON dbo.CustomerChurnCadence_v1 (churned_hard90, t0)
+      INCLUDE (customer_id);
+
+    CREATE NONCLUSTERED INDEX IX_CCC_v1_recent_flags
+      ON dbo.CustomerChurnCadence_v1 (t0, in_renewal_grace)
+      INCLUDE (recency_days, churned_dynamic, churned_hard90, severity_score);
+
+    CREATE NONCLUSTERED INDEX IX_CCC_v1_trends
+      ON dbo.CustomerChurnCadence_v1 (pct_change_3m, pct_change_6m, yoy_change_pct)
+      INCLUDE (customer_id, t0, churned_dynamic, severity_score);
+  END
+  ELSE
+  BEGIN
+    IF COL_LENGTH('dbo.CustomerChurnCadence_v1','severity_score') IS NULL
+      ALTER TABLE dbo.CustomerChurnCadence_v1 ADD severity_score float NULL;
+    IF COL_LENGTH('dbo.CustomerChurnCadence_v1','lateness_component') IS NULL
+      ALTER TABLE dbo.CustomerChurnCadence_v1 ADD lateness_component float NULL;
+    IF COL_LENGTH('dbo.CustomerChurnCadence_v1','credits_component') IS NULL
+      ALTER TABLE dbo.CustomerChurnCadence_v1 ADD credits_component float NULL;
+    IF COL_LENGTH('dbo.CustomerChurnCadence_v1','trend_component') IS NULL
+      ALTER TABLE dbo.CustomerChurnCadence_v1 ADD trend_component float NULL;
+    IF COL_LENGTH('dbo.CustomerChurnCadence_v1','mitigator_component') IS NULL
+      ALTER TABLE dbo.CustomerChurnCadence_v1 ADD mitigator_component float NULL;
+  END
+
+  BEGIN TRY
+    BEGIN TRAN;
+
+    /* A) Invoices */
+    IF OBJECT_ID('tempdb..#inv_pos') IS NOT NULL DROP TABLE #inv_pos;
+    SELECT
+      CAST([Sold-To] AS bigint)                      AS customer_id,
+      CAST(COALESCE([Posting Date],[Billing Date]) AS date) AS tx_date,
+      TRY_CONVERT(decimal(18,2), [Local Net Value])  AS amt_local,
+      NULLIF(LTRIM(RTRIM([+/-])),'')                 AS sign_col,
+      ISNULL([Bill# Doc# Cancelled],'')              AS cancel_flag
+    INTO #inv_pos
+    FROM [SAP].[dbo].[ZSD_REPBILL]
+    WHERE [Billing Date] IS NOT NULL
+      AND [Cancelled Billing Doc#] = 0
+      AND [Bill# Doc# Cancelled] = ''
+      AND COALESCE([Posting Date],[Billing Date]) IS NOT NULL;
+    CREATE INDEX IX_tmp_invpos ON #inv_pos(customer_id, tx_date);
+
+    IF OBJECT_ID('tempdb..#inv_signed') IS NOT NULL DROP TABLE #inv_signed;
+    SELECT
+      i.customer_id,
+      i.tx_date,
+      CAST(CASE
+        WHEN i.cancel_flag = 'X' THEN 0
+        WHEN i.sign_col = '-'     THEN -ABS(i.amt_local)
+        WHEN i.sign_col = '+'     THEN  ABS(i.amt_local)
+        ELSE i.amt_local
+      END AS decimal(18,2)) AS amt_local_signed
+    INTO #inv_signed
+    FROM #inv_pos i;
+    CREATE INDEX IX_tmp_invsigned ON #inv_signed(customer_id, tx_date) INCLUDE (amt_local_signed);
+
+    /* B) Orders */
+    IF OBJECT_ID('tempdb..#oi') IS NOT NULL DROP TABLE #oi;
+    SELECT
+      TRY_CONVERT(bigint, [Sold To]) AS customer_id,
+      CAST([Creation Date] AS date)  AS order_date,
+      [Order Number]                 AS order_num,
+      LEN([Order Number])            AS order_num_len,
+      [Pay Terms]                    AS pay_terms,
+      CAST([Contract Item Start Date] AS date) AS contract_start,
+      CAST([Contract Item End Date]   AS date) AS contract_end,
+      - TRY_CONVERT(decimal(18,2), REPLACE([Planned Revenue Rep#Curr#],',','')) AS planned_revenue
+    INTO #oi
+    FROM [SAP].[dbo].[ZSD_REPORD_ORDER_INTAKE]
+    WHERE [Creation Date] IS NOT NULL;
+    CREATE INDEX IX_tmp_oi ON #oi(customer_id, order_date) INCLUDE (order_num, order_num_len, pay_terms, contract_start, contract_end, planned_revenue);
+
+    IF OBJECT_ID('tempdb..#oi_typed') IS NOT NULL DROP TABLE #oi_typed;
+    SELECT o.*,
+           CASE WHEN o.order_num_len = 6 THEN 1 ELSE 0 END AS is_tech,
+           CASE WHEN o.order_num_len = 8 THEN 1 ELSE 0 END AS is_maint
+    INTO #oi_typed
+    FROM #oi o;
+    CREATE INDEX IX_tmp_oit ON #oi_typed(customer_id, order_date) INCLUDE (is_tech, is_maint, pay_terms, contract_start, contract_end, planned_revenue);
+
+    /* C) t0 */
+    IF OBJECT_ID('tempdb..#t0') IS NOT NULL DROP TABLE #t0;
+    WITH t0i AS (
+      SELECT DISTINCT customer_id, DATEFROMPARTS(YEAR(tx_date),MONTH(tx_date),1) AS t0 FROM #inv_pos
+    ), t0o AS (
+      SELECT DISTINCT customer_id, DATEFROMPARTS(YEAR(order_date),MONTH(order_date),1) AS t0 FROM #oi_typed
+    )
+    SELECT DISTINCT customer_id, t0 INTO #t0 FROM (SELECT * FROM t0i UNION SELECT * FROM t0o) u;
+    CREATE UNIQUE INDEX IX_tmp_t0 ON #t0(customer_id, t0);
+
+    /* D) Recency */
+    IF OBJECT_ID('tempdb..#recency') IS NOT NULL DROP TABLE #recency;
+    SELECT
+      t.customer_id, t.t0,
+      x.last_tx_date,
+      DATEDIFF(day, x.last_tx_date, t.t0) AS recency_days
+    INTO #recency
+    FROM #t0 t
+    OUTER APPLY (
+      SELECT TOP (1) s.tx_date AS last_tx_date
+      FROM #inv_pos s
+      WHERE s.customer_id = t.customer_id
+        AND s.tx_date < t.t0
+      ORDER BY s.tx_date DESC
+    ) x
+    WHERE x.last_tx_date IS NOT NULL;
+    CREATE UNIQUE INDEX IX_tmp_rec ON #recency(customer_id, t0);
+
+    /* E) Gaps */
+    IF OBJECT_ID('tempdb..#inv_days') IS NOT NULL DROP TABLE #inv_days;
+    SELECT DISTINCT customer_id, CAST(tx_date AS date) AS tx_day
+    INTO #inv_days
+    FROM #inv_pos;
+    CREATE UNIQUE INDEX IX_tmp_invdays ON #inv_days(customer_id, tx_day);
+
+    IF OBJECT_ID('tempdb..#gaps') IS NOT NULL DROP TABLE #gaps;
+    SELECT
+      d.customer_id,
+      d.tx_day,
+      LAG(d.tx_day) OVER (PARTITION BY d.customer_id ORDER BY d.tx_day) AS prev_tx_day,
+      NULLIF(DATEDIFF(day,
+             LAG(d.tx_day) OVER (PARTITION BY d.customer_id ORDER BY d.tx_day),
+             d.tx_day), 0) AS gap_days_nonzero
+    INTO #gaps
+    FROM #inv_days d;
+    CREATE INDEX IX_tmp_gaps ON #gaps(customer_id, tx_day) INCLUDE (prev_tx_day, gap_days_nonzero);
+
+    IF OBJECT_ID('tempdb..#gaps_t0') IS NOT NULL DROP TABLE #gaps_t0;
+    SELECT
+      t.customer_id, t.t0, g.gap_days_nonzero
+    INTO #gaps_t0
+    FROM #t0 t
+    JOIN #gaps g
+      ON g.customer_id = t.customer_id
+     AND g.prev_tx_day IS NOT NULL
+     AND g.tx_day < t.t0
+     AND g.tx_day >= DATEADD(month, -@LookbackMonths, t.t0);
+    CREATE INDEX IX_tmp_gapst0 ON #gaps_t0(customer_id, t0) INCLUDE (gap_days_nonzero);
+
+    IF OBJECT_ID('tempdb..#gap_stats') IS NOT NULL DROP TABLE #gap_stats;
+    SELECT DISTINCT
+      gt.customer_id,
+      gt.t0,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(gt.gap_days_nonzero,1)) OVER (PARTITION BY gt.customer_id, gt.t0) AS median_gap_days,
+      PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY COALESCE(gt.gap_days_nonzero,1)) OVER (PARTITION BY gt.customer_id, gt.t0) AS p90_gap_days,
+      AVG(1.0*COALESCE(gt.gap_days_nonzero,1))  OVER (PARTITION BY gt.customer_id, gt.t0) AS mean_gap,
+      STDEV(1.0*COALESCE(gt.gap_days_nonzero,1)) OVER (PARTITION BY gt.customer_id, gt.t0) AS sd_gap
+    INTO #gap_stats
+    FROM #gaps_t0 gt;
+    CREATE UNIQUE INDEX IX_tmp_gapstats ON #gap_stats(customer_id, t0);
+
+    /* F) Renewal grace */
+    IF OBJECT_ID('tempdb..#renewal_flag') IS NOT NULL DROP TABLE #renewal_flag;
+    SELECT DISTINCT
+      t.customer_id, t.t0,
+      CASE
+        WHEN EXISTS (
+          SELECT 1 FROM #oi o
+          WHERE o.customer_id = t.customer_id
+            AND (
+                 (o.contract_end   IS NOT NULL AND ABS(DATEDIFF(day, o.contract_end,   t.t0)) <= @GraceDays) OR
+                 (o.contract_start IS NOT NULL AND ABS(DATEDIFF(day, o.contract_start, t.t0)) <= @GraceDays)
+                )
+        ) THEN 1 ELSE 0 END AS in_renewal_grace
+    INTO #renewal_flag
+    FROM #t0 t;
+    CREATE UNIQUE INDEX IX_tmp_ren ON #renewal_flag(customer_id, t0);
+
+    /* G) Revenue aggs */
+    IF OBJECT_ID('tempdb..#rev_aggs') IS NOT NULL DROP TABLE #rev_aggs;
+    SELECT
+      t.customer_id, t.t0,
+      COALESCE(SUM(CASE WHEN i.tx_date >= DATEADD(day,-180,t.t0) AND i.tx_date < t.t0 THEN i.amt_local_signed END),0) AS rev_180d,
+      COALESCE(ABS(SUM(CASE WHEN i.tx_date >= DATEADD(day,-90, t.t0) AND i.tx_date < t.t0 AND i.amt_local_signed < 0 THEN i.amt_local_signed END)),0) AS rev_returns_90d,
+      COALESCE(COUNT_BIG(CASE WHEN i.tx_date >= DATEADD(day,-90, t.t0) AND i.tx_date < t.t0 AND i.amt_local_signed > 0 THEN 1 END),0) AS invoices_90d,
+      COALESCE(COUNT_BIG(CASE WHEN i.tx_date >= DATEADD(day,-90, t.t0) AND i.tx_date < t.t0 AND i.amt_local_signed < 0 THEN 1 END),0) AS credit_notes_90d
+    INTO #rev_aggs
+    FROM #t0 t
+    LEFT JOIN #inv_signed i
+      ON i.customer_id = t.customer_id
+    GROUP BY t.customer_id, t.t0;
+    CREATE UNIQUE INDEX IX_tmp_revagg ON #rev_aggs(customer_id, t0);
+
+    /* H) Orders/backorders */
+    IF OBJECT_ID('tempdb..#orders_split') IS NOT NULL DROP TABLE #orders_split;
+    SELECT
+      t.customer_id, t.t0,
+      CASE WHEN SUM(CASE WHEN o.order_date >= DATEADD(day,-30,t.t0) AND o.order_date < t.t0 THEN o.planned_revenue END) >= 0
+           THEN SUM(CASE WHEN o.order_date >= DATEADD(day,-30,t.t0) AND o.order_date < t.t0 THEN o.planned_revenue END) ELSE 0 END AS orders_pos_30d,
+      CASE WHEN SUM(CASE WHEN o.order_date >= DATEADD(day,-30,t.t0) AND o.order_date < t.t0 THEN o.planned_revenue END) < 0
+           THEN ABS(SUM(CASE WHEN o.order_date >= DATEADD(day,-30,t.t0) AND o.order_date < t.t0 THEN o.planned_revenue END)) ELSE 0 END AS orders_neg_30d
+    INTO #orders_split
+    FROM #t0 t
+    LEFT JOIN #oi o
+      ON o.customer_id = t.customer_id
+     AND o.order_date  < t.t0
+    GROUP BY t.customer_id, t.t0;
+    CREATE UNIQUE INDEX IX_tmp_ordsplit ON #orders_split(customer_id, t0);
+
+    IF OBJECT_ID('tempdb..#backorders_30') IS NOT NULL DROP TABLE #backorders_30;
+    SELECT
+      t.customer_id, t.t0,
+      COALESCE(SUM(CASE
+        WHEN bo.[Creation Date] >= DATEADD(day,-30,t.t0)
+         AND bo.[Creation Date] <  t.t0
+        THEN TRY_CONVERT(float, REPLACE(bo.[Qty OutStand],',',''))
+      END), 0) AS backorder_qty_30d
+    INTO #backorders_30
+    FROM #t0 t
+    LEFT JOIN [SAP].[dbo].[ZSD_REPORD_BACKORDER] bo
+      ON TRY_CONVERT(bigint, bo.[Sold To]) = t.customer_id
+     AND bo.[Creation Date] IS NOT NULL
+     AND bo.[Creation Date] < t.t0
+    GROUP BY t.customer_id, t.t0;
+    CREATE UNIQUE INDEX IX_tmp_bo30 ON #backorders_30(customer_id, t0);
+
+    /* I) Maintenance mix & cycle */
+    IF OBJECT_ID('tempdb..#oi_mix_180') IS NOT NULL DROP TABLE #oi_mix_180;
+    SELECT
+      t.customer_id, t.t0,
+      SUM(CASE WHEN o.order_date >= DATEADD(day,-180,t.t0) AND o.order_date < t.t0 AND o.is_maint=1 THEN 1 ELSE 0 END) AS maint_orders_180d,
+      SUM(CASE WHEN o.order_date >= DATEADD(day,-180,t.t0) AND o.order_date < t.t0 AND o.is_tech =1 THEN 1 ELSE 0 END) AS tech_orders_180d
+    INTO #oi_mix_180
+    FROM #t0 t
+    LEFT JOIN #oi_typed o
+      ON o.customer_id = t.customer_id
+     AND o.order_date  < t.t0
+    GROUP BY t.customer_id, t.t0;
+    CREATE UNIQUE INDEX IX_tmp_mix180 ON #oi_mix_180(customer_id, t0);
+
+    IF OBJECT_ID('tempdb..#latest_terms') IS NOT NULL DROP TABLE #latest_terms;
+    SELECT
+      t.customer_id, t.t0,
+      LOWER(o_top.pay_terms) AS pt
+    INTO #latest_terms
+    FROM #t0 t
+    OUTER APPLY (
+      SELECT TOP (1) o.pay_terms
+      FROM #oi_typed o
+      WHERE o.customer_id = t.customer_id
+        AND o.order_date  < t.t0
+      ORDER BY o.order_date DESC
+    ) o_top;
+    CREATE UNIQUE INDEX IX_tmp_latestterms ON #latest_terms(customer_id, t0);
+
+    IF OBJECT_ID('tempdb..#maint_median_from_gaps') IS NOT NULL DROP TABLE #maint_median_from_gaps;
+    WITH raw_med AS (
+      SELECT
+        gt.customer_id, gt.t0,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(gt.gap_days_nonzero,1))
+          OVER (PARTITION BY gt.customer_id, gt.t0) AS maint_median_gap_days
+      FROM #gaps_t0 gt
+    )
+    SELECT customer_id, t0, MAX(CAST(maint_median_gap_days AS int)) AS maint_median_gap_days
+    INTO #maint_median_from_gaps
+    FROM raw_med
+    GROUP BY customer_id, t0;
+    CREATE UNIQUE INDEX IX_tmp_mmfq ON #maint_median_from_gaps(customer_id, t0);
+
+    IF OBJECT_ID('tempdb..#maint_cycle') IS NOT NULL DROP TABLE #maint_cycle;
+    SELECT
+      t.customer_id, t.t0,
+      COALESCE(
+        CASE
+          WHEN lt.pt LIKE '%month%'   OR lt.pt LIKE '%30%'  THEN 30
+          WHEN lt.pt LIKE '%quarter%' OR lt.pt LIKE '%qtr%' OR lt.pt LIKE '%90%'  THEN 90
+          WHEN lt.pt LIKE '%annual%'  OR lt.pt LIKE '%year%' OR lt.pt LIKE '%360%' OR lt.pt LIKE '%365%' THEN 365
+          WHEN lt.pt LIKE '%upfront%' OR lt.pt LIKE '%prepay%' THEN 9999
+          ELSE NULL
+        END,
+        mmf.maint_median_gap_days
+      ) AS maint_cycle_days
+    INTO #maint_cycle
+    FROM #t0 t
+    LEFT JOIN #latest_terms lt
+      ON lt.customer_id = t.customer_id AND lt.t0 = t.t0
+    LEFT JOIN #maint_median_from_gaps mmf
+      ON mmf.customer_id = t.customer_id AND mmf.t0 = t.t0;
+    CREATE UNIQUE INDEX IX_tmp_mcycle ON #maint_cycle(customer_id, t0);
+
+    /* J) Monthly rev & trends (+ credit diagnostics) */
+    IF OBJECT_ID('tempdb..#inv_month') IS NOT NULL DROP TABLE #inv_month;
+    SELECT
+      i.customer_id,
+      DATEFROMPARTS(YEAR(i.tx_date), MONTH(i.tx_date), 1) AS month_start,
+      SUM(i.amt_local_signed) AS rev_net_month,
+      SUM(CASE WHEN i.amt_local_signed > 0 THEN 1 ELSE 0 END) AS invoices_pos_cnt,
+      SUM(CASE WHEN i.amt_local_signed < 0 THEN 1 ELSE 0 END) AS credit_notes_cnt
+    INTO #inv_month
+    FROM #inv_signed i
+    GROUP BY i.customer_id, DATEFROMPARTS(YEAR(i.tx_date), MONTH(i.tx_date), 1);
+    CREATE UNIQUE INDEX IX_tmp_invmon ON #inv_month(customer_id, month_start);
+
+    IF OBJECT_ID('tempdb..#trend') IS NOT NULL DROP TABLE #trend;
+    SELECT
+      t.customer_id, t.t0,
+      SUM(CASE WHEN m.month_start >= DATEADD(month,-3,t.t0)  AND m.month_start < t.t0 THEN m.rev_net_month END) AS rev_trailing_3m,
+      SUM(CASE WHEN m.month_start >= DATEADD(month,-6,t.t0)  AND m.month_start < DATEADD(month,-3,t.t0) THEN m.rev_net_month END) AS rev_trailing_prev_3m,
+      SUM(CASE WHEN m.month_start >= DATEADD(month,-6,t.t0)  AND m.month_start < t.t0 THEN m.rev_net_month END) AS rev_trailing_6m,
+      SUM(CASE WHEN m.month_start >= DATEADD(month,-12,t.t0) AND m.month_start < DATEADD(month,-6,t.t0) THEN m.rev_net_month END) AS rev_trailing_prev_6m,
+      MAX(CASE WHEN m.month_start = DATEADD(year,-1,t.t0)   THEN m.rev_net_month END) AS rev_same_month_ly,
+      MAX(CASE WHEN m.month_start = DATEADD(month,-1,t.t0)  THEN m.rev_net_month END) AS rev_prev_month,
+      MAX(CASE WHEN m.month_start = DATEADD(month,-1,t.t0)  THEN m.credit_notes_cnt END) AS credit_notes_prev_month,
+      MAX(CASE WHEN m.month_start = DATEADD(month,-1,t.t0)  THEN m.invoices_pos_cnt END) AS invoices_pos_prev_month,
+      AVG(CASE WHEN m.month_start >= DATEADD(month,-3,t.t0) AND m.month_start < t.t0 THEN 1.0*m.credit_notes_cnt END) AS credit_notes_ma3
+    INTO #trend
+    FROM #t0 t
+    LEFT JOIN #inv_month m
+      ON m.customer_id = t.customer_id
+     AND m.month_start < t.t0
+    GROUP BY t.customer_id, t.t0;
+    CREATE UNIQUE INDEX IX_tmp_trend ON #trend(customer_id, t0);
+
+    IF OBJECT_ID('tempdb..#trend_calc') IS NOT NULL DROP TABLE #trend_calc;
+    SELECT
+      tr.customer_id, tr.t0,
+      CASE WHEN NULLIF(tr.rev_trailing_prev_3m,0) IS NULL THEN NULL
+           ELSE (tr.rev_trailing_3m - tr.rev_trailing_prev_3m) / NULLIF(tr.rev_trailing_prev_3m,0.0) END AS pct_change_3m,
+      CASE WHEN NULLIF(tr.rev_trailing_prev_6m,0) IS NULL THEN NULL
+           ELSE (tr.rev_trailing_6m - tr.rev_trailing_prev_6m) / NULLIF(tr.rev_trailing_prev_6m,0.0) END AS pct_change_6m,
+      CASE WHEN NULLIF(tr.rev_same_month_ly,0) IS NULL THEN NULL
+           ELSE (COALESCE(tr.rev_prev_month,0.0) - tr.rev_same_month_ly) / NULLIF(tr.rev_same_month_ly,0.0) END AS yoy_change_pct,
+      tr.credit_notes_prev_month,
+      tr.invoices_pos_prev_month,
+      tr.credit_notes_ma3
+    INTO #trend_calc
+    FROM #trend tr;
+    CREATE UNIQUE INDEX IX_tmp_trendcalc ON #trend_calc(customer_id, t0);
+
+    /* K) Threshold */
+    IF OBJECT_ID('tempdb..#threshold_final') IS NOT NULL DROP TABLE #threshold_final;
+    WITH thr_raw AS (
+      SELECT
+        t.customer_id, t.t0,
+        CASE WHEN (mx.maint_orders_180d >= mx.tech_orders_180d AND mx.maint_orders_180d > 0) THEN 1 ELSE 0 END AS is_maintenance_heavy,
+        CASE
+          WHEN mc.maint_cycle_days IS NOT NULL
+               THEN CAST(ROUND(1.2 * CAST(mc.maint_cycle_days AS float),0) AS int)
+          ELSE
+            CASE
+              WHEN gs.p90_gap_days IS NOT NULL AND gs.median_gap_days IS NOT NULL
+                   THEN CASE WHEN gs.p90_gap_days > @K_Mult*gs.median_gap_days
+                             THEN gs.p90_gap_days ELSE @K_Mult*gs.median_gap_days END
+              WHEN gs.p90_gap_days IS NOT NULL THEN gs.p90_gap_days
+              WHEN gs.median_gap_days IS NOT NULL THEN @K_Mult*gs.median_gap_days
+              ELSE NULL
+            END
+        END
+          + CASE WHEN ren.in_renewal_grace=1 THEN @GraceDays ELSE 0 END AS threshold_days_raw,
+        mc.maint_cycle_days
+      FROM #t0 t
+      LEFT JOIN #oi_mix_180     mx  ON mx.customer_id = t.customer_id AND mx.t0 = t.t0
+      LEFT JOIN #maint_cycle    mc  ON mc.customer_id = t.customer_id AND mc.t0 = t.t0
+      LEFT JOIN #gap_stats      gs  ON gs.customer_id = t.customer_id AND gs.t0 = t.t0
+      LEFT JOIN #renewal_flag   ren ON ren.customer_id = t.customer_id AND ren.t0 = t.t0
+    )
+    SELECT
+      customer_id, t0,
+      CASE WHEN threshold_days_raw < @MinThresholdDays THEN @MinThresholdDays ELSE threshold_days_raw END AS threshold_days,
+      is_maintenance_heavy,
+      maint_cycle_days
+    INTO #threshold_final
+    FROM thr_raw;
+    CREATE UNIQUE INDEX IX_tmp_thr ON #threshold_final(customer_id, t0);
+
+    /* L) Forward 90d */
+    IF OBJECT_ID('tempdb..#forward') IS NOT NULL DROP TABLE #forward;
+    SELECT
+      t.customer_id, t.t0,
+      COALESCE(SUM(CASE WHEN p.tx_date >= t.t0 AND p.tx_date < DATEADD(day,90,t.t0) THEN p.amt_local_signed END),0) AS forward_rev_pos_90d
+    INTO #forward
+    FROM #t0 t
+    LEFT JOIN #inv_signed p
+      ON p.customer_id = t.customer_id
+    GROUP BY t.customer_id, t.t0;
+    CREATE UNIQUE INDEX IX_tmp_fwd ON #forward(customer_id, t0);
+
+    /* M) Truncate target */
+    TRUNCATE TABLE dbo.CustomerChurnCadence_v1;
+
+    /* N) Insert final rows — severity computed via CROSS APPLY (fixes 4145) */
+    ;WITH final_rows AS (
+      SELECT
+        r.customer_id, r.t0,
+        r.recency_days,
+
+        CAST(gs.median_gap_days AS int) AS median_gap_days,
+        CAST(gs.p90_gap_days    AS int) AS p90_gap_days,
+        CASE WHEN gs.mean_gap > 0 THEN gs.sd_gap/gs.mean_gap ELSE NULL END AS cv_gap,
+
+        ren.in_renewal_grace,
+        ra.rev_180d,
+        ra.rev_returns_90d,
+        ra.invoices_90d,
+        ra.credit_notes_90d,
+        os.orders_pos_30d,
+        os.orders_neg_30d,
+        bo.backorder_qty_30d,
+        trc.pct_change_3m,
+        trc.pct_change_6m,
+        trc.yoy_change_pct,
+        trc.credit_notes_prev_month,
+        trc.invoices_pos_prev_month,
+        trc.credit_notes_ma3,
+
+        CASE WHEN fwd.forward_rev_pos_90d > 0 THEN 0 ELSE 1 END AS churned_hard90,
+        thr.threshold_days,
+        CASE WHEN r.recency_days > thr.threshold_days THEN 1 ELSE 0 END AS churned_dynamic,
+        thr.is_maintenance_heavy,
+        thr.maint_cycle_days,
+
+        CASE 
+          WHEN r.recency_days > thr.threshold_days
+          THEN CONCAT(
+                 'Late vs cadence: recency ', CONVERT(varchar(12), r.recency_days), 'd > threshold ',
+                 CONVERT(varchar(12), thr.threshold_days), 'd',
+                 CASE WHEN ren.in_renewal_grace = 1 THEN ' (within renewal grace window)' ELSE '' END,
+                 CASE WHEN ra.invoices_90d = 0 THEN '; 0 invoices in prior 90d' ELSE '' END,
+                 CASE WHEN ra.rev_returns_90d > 0 THEN '; returns_90d=' + CONVERT(varchar(24), ra.rev_returns_90d) ELSE '' END,
+                 CASE WHEN ISNULL(os.orders_pos_30d,0) = 0 THEN '; no orders in prior 30d' ELSE '' END,
+                 CASE WHEN ISNULL(bo.backorder_qty_30d,0) > 0 THEN '; backorders_30d=' + CONVERT(varchar(24), bo.backorder_qty_30d) ELSE '' END,
+                 CASE 
+                   WHEN (ISNULL(trc.pct_change_3m,0) <= -0.30 OR ISNULL(trc.pct_change_6m,0) <= -0.30 OR ISNULL(trc.yoy_change_pct,0) <= -0.30)
+                   THEN CONCAT(
+                          '; spend decline: ',
+                          CONCAT(
+                            CASE WHEN ISNULL(trc.pct_change_3m,0) <= -0.30 THEN '3M_DROP' ELSE '' END,
+                            CASE WHEN ISNULL(trc.pct_change_6m,0) <= -0.30 
+                                 THEN CASE WHEN ISNULL(trc.pct_change_3m,0) <= -0.30 THEN '|6M_DROP' ELSE '6M_DROP' END 
+                                 ELSE '' END,
+                            CASE WHEN ISNULL(trc.yoy_change_pct,0) <= -0.30 
+                                 THEN CASE WHEN (ISNULL(trc.pct_change_3m,0) <= -0.30 OR ISNULL(trc.pct_change_6m,0) <= -0.30) THEN '|YOY_DROP' ELSE 'YOY_DROP' END
+                                 ELSE '' END
+                          )
+                        )
+                   ELSE '' 
+                 END
+               )
+          ELSE NULL
+        END AS churn_reason_dynamic,
+
+        CASE 
+          WHEN r.recency_days > thr.threshold_days
+          THEN CONCAT(
+                 'RECENCY_GT_', CONVERT(varchar(12), thr.threshold_days), 'D',
+                 CASE WHEN ren.in_renewal_grace = 1 THEN '|RENEWAL_GRACE' ELSE '' END,
+                 CASE WHEN ra.invoices_90d = 0 THEN '|NO_INV_90D' ELSE '' END,
+                 CASE WHEN ra.rev_returns_90d > 0 THEN '|RETURNS_90D' ELSE '' END,
+                 CASE WHEN ISNULL(os.orders_pos_30d,0) = 0 THEN '|NO_ORDERS_30D' ELSE '' END,
+                 CASE WHEN ISNULL(bo.backorder_qty_30d,0) > 0 THEN '|BACKORDERS_30D' ELSE '' END,
+                 CASE 
+                   WHEN (ISNULL(trc.pct_change_3m,0) <= -0.30 OR ISNULL(trc.pct_change_6m,0) <= -0.30 OR ISNULL(trc.yoy_change_pct,0) <= -0.30)
+                   THEN CONCAT('|SPEND_DOWN(',
+                               CONCAT(
+                                 CASE WHEN ISNULL(trc.pct_change_3m,0) <= -0.30 THEN '3M_DROP' ELSE '' END,
+                                 CASE WHEN ISNULL(trc.pct_change_6m,0) <= -0.30 
+                                      THEN CASE WHEN ISNULL(trc.pct_change_3m,0) <= -0.30 THEN '|6M_DROP' ELSE '6M_DROP' END 
+                                      ELSE '' END,
+                                 CASE WHEN ISNULL(trc.yoy_change_pct,0) <= -0.30 
+                                      THEN CASE WHEN (ISNULL(trc.pct_change_3m,0) <= -0.30 OR ISNULL(trc.pct_change_6m,0) <= -0.30) THEN '|YOY_DROP' ELSE 'YOY_DROP' END
+                                      ELSE '' END
+                               ),
+                               ')')
+                   ELSE '' 
+                 END
+               )
+          ELSE NULL
+        END AS churn_reason_code_dynamic,
+
+        CASE 
+          WHEN CASE WHEN fwd.forward_rev_pos_90d > 0 THEN 0 ELSE 1 END = 1
+          THEN 'No positive posted revenue in the 90 days after t0'
+          ELSE NULL
+        END AS churn_reason_hard90
+
+      FROM #recency r
+      JOIN #gap_stats     gs  ON gs.customer_id = r.customer_id AND gs.t0 = r.t0
+      JOIN #renewal_flag  ren ON ren.customer_id = r.customer_id AND ren.t0 = r.t0
+      JOIN #rev_aggs      ra  ON ra.customer_id = r.customer_id AND ra.t0 = r.t0
+      JOIN #orders_split  os  ON os.customer_id = r.customer_id AND os.t0 = r.t0
+      JOIN #backorders_30 bo  ON bo.customer_id = r.customer_id AND bo.t0 = r.t0
+      JOIN #trend_calc    trc ON trc.customer_id = r.customer_id AND trc.t0 = r.t0
+      JOIN #forward       fwd ON fwd.customer_id = r.customer_id AND fwd.t0 = r.t0
+      JOIN #threshold_final thr ON thr.customer_id = r.customer_id AND thr.t0 = r.t0
+    )
+    INSERT INTO dbo.CustomerChurnCadence_v1
+    (
+      customer_id, t0, recency_days,
+      median_gap_days, p90_gap_days, cv_gap,
+      in_renewal_grace,
+      rev_180d, rev_returns_90d,
+      invoices_90d, credit_notes_90d,
+      orders_pos_30d, orders_neg_30d, backorder_qty_30d,
+      pct_change_3m, pct_change_6m, yoy_change_pct,
+      credit_notes_prev_month, invoices_pos_prev_month, credit_notes_ma3,
+      churned_hard90, threshold_days, churned_dynamic,
+      is_maintenance_heavy, maint_cycle_days,
+      churn_reason_dynamic, churn_reason_code_dynamic, churn_reason_hard90,
+      severity_score, lateness_component, credits_component, trend_component, mitigator_component
+    )
+    SELECT
+      fr.customer_id, fr.t0, fr.recency_days,
+      fr.median_gap_days, fr.p90_gap_days, fr.cv_gap,
+      fr.in_renewal_grace,
+      fr.rev_180d, fr.rev_returns_90d,
+      fr.invoices_90d, fr.credit_notes_90d,
+      fr.orders_pos_30d, fr.orders_neg_30d, fr.backorder_qty_30d,
+      fr.pct_change_3m, fr.pct_change_6m, fr.yoy_change_pct,
+      fr.credit_notes_prev_month, fr.invoices_pos_prev_month, fr.credit_notes_ma3,
+      fr.churned_hard90, fr.threshold_days, fr.churned_dynamic,
+      fr.is_maintenance_heavy, fr.maint_cycle_days,
+      fr.churn_reason_dynamic, fr.churn_reason_code_dynamic, fr.churn_reason_hard90,
+
+      -- === Components via CROSS APPLY to avoid 4145 ===
+      100.0 * CASE WHEN raw.raw_score < 0 THEN 0
+                   WHEN raw.raw_score > 1 THEN 1
+                   ELSE raw.raw_score END AS severity_score,
+      comp.lateness_component,
+      comp.credits_component,
+      comp.trend_component,
+      comp.mitigator_component
+    FROM final_rows fr
+    CROSS APPLY (
+      SELECT
+        CAST(1.0 / (1.0 + EXP(
+          -4.0 * ((1.0 * (fr.recency_days - fr.threshold_days)) / NULLIF(fr.threshold_days, 0.0))
+        )) AS float) AS lateness_component,
+
+        CAST(
+          CASE 
+            WHEN NULLIF(ABS(fr.rev_180d),0.0) IS NULL THEN 0.0
+            ELSE
+              CASE 
+                WHEN (fr.rev_returns_90d / NULLIF(ABS(fr.rev_180d), 1e-6)) < 0 THEN 0
+                WHEN (fr.rev_returns_90d / NULLIF(ABS(fr.rev_180d), 1e-6)) > 1 THEN 1
+                ELSE  (fr.rev_returns_90d / NULLIF(ABS(fr.rev_180d), 1e-6))
+              END
+          END AS float
+        ) AS credits_component,
+
+        CAST(
+          (CASE WHEN ISNULL(fr.pct_change_3m,  0.0) <= -0.30 THEN 0.4 ELSE 0.0 END) +
+          (CASE WHEN ISNULL(fr.pct_change_6m,  0.0) <= -0.30 THEN 0.4 ELSE 0.0 END) +
+          (CASE WHEN ISNULL(fr.yoy_change_pct, 0.0) <= -0.30 THEN 0.3 ELSE 0.0 END)
+        AS float) AS trend_component,
+
+        CAST(
+          (CASE WHEN ISNULL(fr.orders_pos_30d,0) > 0 THEN 0.5 ELSE 0.0 END) +
+          (CASE WHEN fr.in_renewal_grace = 1          THEN 0.5 ELSE 0.0 END)
+        AS float) AS mitigator_component
+    ) AS comp
+    CROSS APPLY (
+      SELECT CAST(0.6*comp.lateness_component
+                + 0.2*comp.credits_component
+                + 0.2*comp.trend_component
+                - 0.15*comp.mitigator_component AS float) AS raw_score
+    ) AS raw;
+
+    COMMIT;
+
+    IF @ReturnRows = 1
+      SELECT * FROM dbo.CustomerChurnCadence_v1 ORDER BY churned_dynamic DESC, severity_score DESC, customer_id, t0;
+
+  END TRY
+  BEGIN CATCH
+    IF XACT_STATE() <> 0 ROLLBACK;
+    THROW;
+  END CATCH
+END
+GO
+
+
