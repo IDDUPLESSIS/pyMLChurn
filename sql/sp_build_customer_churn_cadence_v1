@@ -1,7 +1,7 @@
 USE [SAP]
 GO
 
-/****** Object:  StoredProcedure [dbo].[sp_build_customer_churn_cadence_v1]    Script Date: 11/11/2025 8:58:59 AM ******/
+/****** Object:  StoredProcedure [dbo].[sp_build_customer_churn_cadence_v1]    Script Date: 11/12/2025 8:11:05 AM ******/
 SET ANSI_NULLS ON
 GO
 
@@ -120,7 +120,7 @@ Change control
 */
 
 
-CREATE PROCEDURE [dbo].[sp_build_customer_churn_cadence_v1]
+ALTER PROCEDURE [dbo].[sp_build_customer_churn_cadence_v1]
   @LookbackMonths   INT   = 24,
   @MinThresholdDays INT   = 14,
   @K_Mult           FLOAT = 2.0,
@@ -222,7 +222,8 @@ BEGIN
     WHERE [Billing Date] IS NOT NULL
       AND [Cancelled Billing Doc#] = 0
       AND [Bill# Doc# Cancelled] = ''
-      AND COALESCE([Posting Date],[Billing Date]) IS NOT NULL;
+      AND COALESCE([Posting Date],[Billing Date]) IS NOT NULL
+	  AND [Sales Org] in ('US01');
     CREATE INDEX IX_tmp_invpos ON #inv_pos(customer_id, tx_date);
 
     IF OBJECT_ID('tempdb..#inv_signed') IS NOT NULL DROP TABLE #inv_signed;
@@ -252,7 +253,9 @@ BEGIN
       - TRY_CONVERT(decimal(18,2), REPLACE([Planned Revenue Rep#Curr#],',','')) AS planned_revenue
     INTO #oi
     FROM [SAP].[dbo].[ZSD_REPORD_ORDER_INTAKE]
-    WHERE [Creation Date] IS NOT NULL;
+    WHERE [Creation Date] IS NOT NULL 
+		AND [Reject Reason Code] = '' 
+		AND [Company] in ('US01');
     CREATE INDEX IX_tmp_oi ON #oi(customer_id, order_date) INCLUDE (order_num, order_num_len, pay_terms, contract_start, contract_end, planned_revenue);
 
     IF OBJECT_ID('tempdb..#oi_typed') IS NOT NULL DROP TABLE #oi_typed;
@@ -396,6 +399,8 @@ BEGIN
       ON TRY_CONVERT(bigint, bo.[Sold To]) = t.customer_id
      AND bo.[Creation Date] IS NOT NULL
      AND bo.[Creation Date] < t.t0
+	 AND bo.[Reject Reason Code] <> ''
+	 AND bo.[Company] in ('US01')
     GROUP BY t.customer_id, t.t0;
     CREATE UNIQUE INDEX IX_tmp_bo30 ON #backorders_30(customer_id, t0);
 
