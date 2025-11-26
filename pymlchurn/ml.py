@@ -61,6 +61,63 @@ def build_pipeline(n_features: int) -> Pipeline:
     return pipe
 
 
+def _temperature_scale(proba: np.ndarray, T: float = 8.0) -> np.ndarray:
+    """
+    Soften extreme probabilities from a very confident model by dividing
+    logits by a temperature T > 1. Larger T => more moderate probabilities.
+    """
+    eps = 1e-9
+    p = np.clip(proba.astype(float), eps, 1.0 - eps)
+    logit = np.log(p / (1.0 - p))
+    logit_scaled = logit / float(T)
+    p_scaled = 1.0 / (1.0 + np.exp(-logit_scaled))
+    return p_scaled
+
+
+def _rule_based_pseudo_label(df: pd.DataFrame) -> Optional[np.ndarray]:
+    """
+    Build a pseudo-label for churn using current snapshot signals when no
+    reliable supervised label is available.
+
+    Rules (any of these imply churn=1):
+      - KnownChurn_Effective == 1 (explicitly confirmed churn)
+      - ChurnIf_NoOrd90 == 1  (no orders in last 90 days)
+      - ChurnIf_NoInv90 == 1  (no invoices in last 90 days)
+      - ChurnIf_NoMaintOrd90_WithinGrace == 1 (no maint orders within grace)
+      - EoxExpired_NoOrders90d == 1
+      - EoxRisk_NoMaintRenewal == 1
+      - EoxExpired_UnpaidInv90plus == 1
+    """
+    if df.empty:
+        return None
+
+    y = np.zeros(len(df), dtype=int)
+
+    # Known explicit churn
+    if "KnownChurn_Effective" in df.columns:
+        known = pd.to_numeric(df["KnownChurn_Effective"], errors="coerce").fillna(0.0)
+        y = np.maximum(y, (known >= 1.0).astype(int))
+
+    strong_flags = [
+        "ChurnIf_NoOrd90",
+        "ChurnIf_NoInv90",
+        "ChurnIf_NoMaintOrd90_WithinGrace",
+        "EoxExpired_NoOrders90d",
+        "EoxRisk_NoMaintRenewal",
+        "EoxExpired_UnpaidInv90plus",
+    ]
+    for col in strong_flags:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        y = np.maximum(y, (vals >= 1.0).astype(int))
+
+    # Require at least two classes to be useful
+    if np.unique(y).shape[0] < 2:
+        return None
+    return y
+
+
 def _risk_direction(col: str) -> str:
     """Return which direction increases churn risk for this feature.
     Values: 'high', 'low', 'neg' (negative values), 'pos' (positive values).
@@ -104,6 +161,61 @@ def _risk_direction(col: str) -> str:
 def _friendly_label(col: str) -> str:
     mapping = {
         "recency_days": "No purchases for",
+        "Recency_Orders_Days": "No orders for",
+        "Recency_MaintOrders_Days": "No maintenance orders for",
+        "Recency_Invoices_Days": "No invoices for",
+        "OrderValue_90d": "Order value in last 90 days",
+        "OrderValue_Prev90d": "Order value in previous 90 days",
+        "OrderValue_3m_Change": "Change in order value vs prior 90 days",
+        "OrderValue_3m_ChangePct": "Order value change vs prior 90 days",
+        "OrderFreq_90d": "Orders in last 90 days",
+        "OrderFreq_Prev90d": "Orders in previous 90 days",
+        "OrderFreq_3m_Change": "Change in order frequency vs prior 90 days",
+        "OrderFreq_3m_ChangePct": "Order frequency change vs prior 90 days",
+        "MaintOrderValue_90d": "Maintenance order value in last 90 days",
+        "ProdOrderValue_90d": "Product order value in last 90 days",
+        "ProdRatio_90d": "Share of product revenue",
+        "MaintRatio_90d": "Share of maintenance revenue",
+        "IsProductHeavy_90d": "Product-heavy buying profile",
+        "IsMaintHeavy_90d": "Maintenance-heavy buying profile",
+        "BackorderCount_180dPlus": "Old backorders (180+ days)",
+        "UnpaidInv_OverTerms_Count": "Invoices over terms",
+        "UnpaidInv_90plus_Count": "Invoices 90+ days overdue",
+        "ARBucket_Current_Count": "Invoices current",
+        "ARBucket_1_30_Count": "Invoices 1-30 days overdue",
+        "ARBucket_31_60_Count": "Invoices 31-60 days overdue",
+        "ARBucket_61_90_Count": "Invoices 61-90 days overdue",
+        "ARBucket_91_120_Count": "Invoices 91-120 days overdue",
+        "ARBucket_121_180_Count": "Invoices 121-180 days overdue",
+        "ARBucket_180Plus_Count": "Invoices 180+ days overdue",
+        "DSO_OpenInvoices": "Days sales outstanding (open invoices)",
+        "ReturnInvCount_90d": "Return invoices in last 90 days",
+        "CreditValue_90d": "Credit value in last 90 days",
+        "CreditCount_90d": "Credit notes in last 90 days",
+        "ChurnIf_NoOrd90": "No orders in last 90 days",
+        "ChurnIf_NoInv90": "No invoices in last 90 days",
+        "ChurnIf_NoMaintOrd90_WithinGrace": "No maintenance orders within grace period",
+        "PredChurn_Unpaid90plus": "Unpaid invoices 90+ days",
+        "PredChurn_HighBackorders": "High backorders",
+        "Eox_MinDaysToLDOS": "Days to least days-of-support",
+        "Risk_EoX_12m": "End-of-support risk in next 12 months",
+        "Risk_EoX_6m": "End-of-support risk in next 6 months",
+        "Risk_EoX_3m": "End-of-support risk in next 3 months",
+        "PredChurn_EoXExpired": "End-of-support already expired",
+        "Eox_Rev_Expired_12m": "Expired revenue in last 12 months",
+        "Eox_Rev_Risk12m": "At-risk revenue in next 12 months",
+        "Eox_Rev_Total12m": "Total EoX-related revenue (12 months)",
+        "Eox_RevExpiredPct_12m": "Share of revenue from expired items",
+        "Eox_RevRiskPct_12m": "Share of revenue at EoX risk",
+        "Eox_HasExpiredRevenue_12m": "Has expired-revenue items",
+        "Eox_HasRiskRevenue_12m": "Has at-risk revenue items",
+        "Eox_MajorityExpired_12m": "Most revenue on expired items",
+        "Eox_SKU_CountExpired": "Expired SKUs count",
+        "Eox_SKU_CountRisk12m": "At-risk SKUs count (12 months)",
+        "EoxExpired_NoOrders90d": "No orders in 90 days on expired SKUs",
+        "EoxRisk_NoMaintRenewal": "No maintenance renewal on at-risk SKUs",
+        "EoxExpired_UnpaidInv90plus": "Unpaid invoices 90+ days on expired SKUs",
+        "EoxExpired_CreditSpike90d": "Credit spike on expired SKUs (90 days)",
         "median_gap_days": "Typical gap between purchases",
         "p90_gap_days": "Long purchase gaps (90th percentile)",
         "cv_gap": "Irregular buying cadence",
@@ -277,16 +389,142 @@ def train_and_predict(df: pd.DataFrame, cfg: MLConfig) -> pd.DataFrame:
         # Coerce target to binary 0/1
         y = pd.to_numeric(work[cfg.target_col], errors="coerce").fillna(0).astype(int).to_numpy()
 
-    pipe = build_pipeline(n_features=len(cfg.feature_cols))
+    # Handle cases where we cannot train a supervised model from the DB label:
+    # fall back to rule-based pseudo labels; only if that also fails do we use
+    # a simple heuristic risk score.
+    if y is None or np.unique(y).shape[0] < 2:
+        pseudo = _rule_based_pseudo_label(df)
+        if pseudo is not None and np.unique(pseudo).shape[0] >= 2:
+            y = pseudo
+        else:
+            # Fallback: rule-based risk scoring using engineered churn flags
+            flag_candidates = [
+                "ChurnIf_NoOrd90",
+                "ChurnIf_NoInv90",
+                "ChurnIf_NoMaintOrd90_WithinGrace",
+                "PredChurn_Unpaid90plus",
+                "PredChurn_HighBackorders",
+            ]
+            available_flags = [c for c in flag_candidates if c in df.columns]
 
-    if y is not None:
-        pipe.fit(X, y)
-        proba = pipe.predict_proba(X)[:, 1]
-        pred = (proba >= 0.5).astype(int)
-    else:
-        # If no target provided, we can't train supervised model; fall back to zeros
-        proba = np.zeros(X.shape[0], dtype=float)
-        pred = np.zeros(X.shape[0], dtype=int)
+            if available_flags:
+                flags = df[available_flags].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                for c in available_flags:
+                    flags[c] = flags[c].clip(0, 1)
+                risk_score = flags.mean(axis=1)
+                proba = risk_score.to_numpy(dtype=float)
+                pred = (proba >= 0.5).astype(int)
+
+                reasons = []
+                for i in range(len(df)):
+                    phrases = []
+                    for col in available_flags:
+                        try:
+                            if float(flags.iloc[i][col]) >= 0.5:
+                                label = _friendly_label(col)
+                                if label:
+                                    phrases.append(label)
+                        except Exception:
+                            continue
+                    reasons.append("; ".join(phrases) if phrases else "")
+            else:
+                # If no rule flags are present, fall back to zeros
+                proba = np.zeros(X.shape[0], dtype=float)
+                pred = np.zeros(X.shape[0], dtype=int)
+                reasons = [""] * len(df)
+
+            result = pd.DataFrame(
+                {
+                    cfg.customer_id_col: df[cfg.customer_id_col].to_numpy(),
+                    "predicted_churn_90d": pred,
+                    "predicted_churn_probability_90d": proba,
+                }
+            )
+            result["predicted_churn_probability_90d_pct"] = (
+                result["predicted_churn_probability_90d"].astype(float) * 100.0
+            ).round(2)
+            if cfg.date_col and cfg.date_col in df.columns:
+                result["as_of_date"] = df[cfg.date_col].astype(str).to_numpy()
+
+            # Rule-based reasons in this fallback path
+            result["predicted_churn_reason_90d"] = reasons
+
+            if cfg.target_col and cfg.target_col in df.columns:
+                actual = pd.to_numeric(df[cfg.target_col], errors="coerce").fillna(0).astype(int).to_numpy()
+                result["actual_churned_90d"] = actual
+                result["actual_churn_reason_90d"] = [""] * len(result)
+
+            return result
+
+    # At this point y is guaranteed to be non-None with at least two classes
+    if y is None or np.unique(y).shape[0] < 2:
+        # Safety net; should be rare
+        # Fallback: rule-based risk scoring using engineered churn flags
+        flag_candidates = [
+            "ChurnIf_NoOrd90",
+            "ChurnIf_NoInv90",
+            "ChurnIf_NoMaintOrd90_WithinGrace",
+            "PredChurn_Unpaid90plus",
+            "PredChurn_HighBackorders",
+        ]
+        available_flags = [c for c in flag_candidates if c in df.columns]
+
+        if available_flags:
+            flags = df[available_flags].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            for c in available_flags:
+                flags[c] = flags[c].clip(0, 1)
+            risk_score = flags.mean(axis=1)
+            proba = risk_score.to_numpy(dtype=float)
+            pred = (proba >= 0.5).astype(int)
+
+            reasons = []
+            for i in range(len(df)):
+                phrases = []
+                for col in available_flags:
+                    try:
+                        if float(flags.iloc[i][col]) >= 0.5:
+                            label = _friendly_label(col)
+                            if label:
+                                phrases.append(label)
+                    except Exception:
+                        continue
+                reasons.append("; ".join(phrases) if phrases else "")
+        else:
+            # If no rule flags are present, fall back to zeros
+            proba = np.zeros(X.shape[0], dtype=float)
+            pred = np.zeros(X.shape[0], dtype=int)
+            reasons = [""] * len(df)
+
+        result = pd.DataFrame(
+            {
+                cfg.customer_id_col: df[cfg.customer_id_col].to_numpy(),
+                "predicted_churn_90d": pred,
+                "predicted_churn_probability_90d": proba,
+            }
+        )
+        result["predicted_churn_probability_90d_pct"] = (
+            result["predicted_churn_probability_90d"].astype(float) * 100.0
+        ).round(2)
+        if cfg.date_col and cfg.date_col in df.columns:
+            result["as_of_date"] = df[cfg.date_col].astype(str).to_numpy()
+
+        # Rule-based reasons in this fallback path
+        result["predicted_churn_reason_90d"] = reasons
+
+        if cfg.target_col and cfg.target_col in df.columns:
+            actual = pd.to_numeric(df[cfg.target_col], errors="coerce").fillna(0).astype(int).to_numpy()
+            result["actual_churned_90d"] = actual
+            result["actual_churn_reason_90d"] = [""] * len(result)
+
+        return result
+
+    pipe = build_pipeline(n_features=len(cfg.feature_cols))
+    pipe.fit(X, y)
+    proba_raw = pipe.predict_proba(X)[:, 1]
+    # Apply temperature scaling to avoid extreme 0/1 probabilities when
+    # training from rule-based or noisy labels.
+    proba = _temperature_scale(proba_raw, T=8.0)
+    pred = (proba >= 0.5).astype(int)
 
     result = pd.DataFrame(
         {

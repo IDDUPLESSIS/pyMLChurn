@@ -1,7 +1,7 @@
 pyMLChurn - SQL + ML churn predictions
 =====================================
 
-Python project that connects to SQL Server and pulls data from `[SAP].[dbo].[CustomerChurnCadence_v1]`, then trains a quick model and exports churn predictions with human-readable reasons. Supports Windows Integrated Auth or SQL login.
+Python project that connects to SQL Server and pulls data from `[SAP].[chrn01].[v_train_dataset]`, then trains a quick model and exports churn predictions with human-readable reasons. Supports Windows Integrated Auth or SQL login.
 
 Quick Start
 - Clone: `git clone https://github.com/IDDUPLESSIS/pyMLChurn && cd pyMLChurn`
@@ -45,12 +45,12 @@ Double‑click EXE
 - Debug runner: `run_exe_debug.bat` captures console output to `dist\pyMLChurn\pyMLChurn_win_stdout_stderr.txt`
 
 Connection and refresh
-- Pre-query stored procedure: runs `[dbo].[sp_build_customer_churn_cadence_v1]` once per 24h
+- Pre-query stored procedure: runs `[chrn01].[sp_RunDailyChurnJob]` once per 24h
   - Control with `--sp-ttl-hours 24`, `--force-sp`, `--skip-sp`
 - Connectivity check: `--check` or `--check-only`
 
 Query behavior
-- Pulls only model features + label from `[SAP].[dbo].[CustomerChurnCadence_v1]`
+- Pulls engineered feature set + labels from `[SAP].[chrn01].[v_train_dataset]`
 - Snapshot handling:
   - Default keeps the latest snapshot per customer (by `as_of_date`)
   - Keep all snapshots: `--keep-all-rows`
@@ -58,29 +58,36 @@ Query behavior
 
 Model + explanations
 - LogisticRegression with imputation and scaling (class_weight balanced)
+- When database labels are missing or all zero, builds a pseudo-label from churn business rules (e.g. no orders in 90 days, no maint orders within grace, EoX not renewed, unpaid 90+ AR) and trains on that
+- Applies temperature scaling so probabilities are realistic (not just 0/1)
 - SHAP explanations for per-row reasons (falls back to coefficients if needed)
-- Default target (label) is `churned_hard90` (actual churn within 90 days)
+- Default target (label) is `Label_Churn_90d` when available
 
 Output columns
 - Friendly headers (default): `--headers friendly`
   - Customer ID
   - Snapshot Date
+  - Days Since Last Purchase (Today)
+  - Churned Now (Business Rule)
+  - Why (Business Rule)
   - Churned Within 90 Days (Actual)
   - Why They Churned (Actual)
   - Predicted to Churn (Next 90 Days)
   - Churn Probability % (Next 90 Days)
   - Churn Probability (Next 90 Days)
   - Why At Risk (Predicted)
+  - Predicted Churn Month (Next 90 Days)
   - CreatedOn (timestamp)
 - Technical headers: `--headers technical`
-  - `customer_id`, `as_of_date_t0`, `actual_churned_90d_t0+90d`, `actual_churn_reason_t0`,
-    `predicted_churn_90d_t0+90d`, `predicted_churn_probability_90d_t0+90d`,
-    `predicted_churn_probability_90d_pct_t0+90d`, `predicted_churn_reason_t0`, `CreatedOn`
+  - `CustomerId`, `as_of_date_t0`, `days_since_last_purchase_today`, `business_churn_now`, `business_churn_reason`,
+    `actual_churned_90d_t0+90d`, `actual_churn_reason_t0`, `predicted_churn_90d_t0+90d`,
+    `predicted_churn_probability_90d_t0+90d`, `predicted_churn_probability_90d_pct_t0+90d`,
+    `predicted_churn_reason_t0`, `predicted_churn_month_t0+90d`, `CreatedOn`
 
 Common flags
 - `--raw-output raw.csv` save the raw query rows used by the model
 - `--headers friendly|technical` choose column names
-- `--target-col churned_hard90|churned_dynamic` change label
+- `--target-col Label_Churn_90d|Label_Churn_180d|Label_HasAnyChurn` change label (when available)
 - `--as-of 2025-01-31` restrict to a date; `--keep-all-rows` keep all snapshots
 - `--auth windows|sql`, `--username`, `--password`, `--driver`, `--no-encrypt`, `--no-trust-cert`
 
@@ -89,27 +96,24 @@ Notes
 - Server can include port `host,port` (e.g., `server.local,1533`).
 - Retries with exponential backoff are built-in for SP and queries.
 
-Feature glossary (units)
-- recency_days: days since last purchase (days)
-- median_gap_days, p90_gap_days: typical/long gaps between purchases (days)
-- cv_gap: irregularity of purchase cadence (unitless)
-- in_renewal_grace: in renewal grace period (true/false)
-- rev_180d: revenue in last 180 days (currency)
-- rev_returns_90d: value of returns in last 90 days (currency)
-- invoices_90d: invoices in last 90 days (count)
-- credit_notes_90d: credit notes in last 90 days (count)
-- orders_pos_30d: positive order value in last 30 days (currency)
-- orders_neg_30d: negative order value in last 30 days (currency)
-- backorder_qty_30d: backorder quantity in last 30 days (count/units)
-- pct_change_3m, pct_change_6m, yoy_change_pct: sales change vs prior periods (percent)
-- credit_notes_prev_month: credit notes last month (count)
-- invoices_pos_prev_month: invoices last month (count)
-- credit_notes_ma3: credit notes per month (3-month average) (count per month)
-- threshold_days: days past expected purchase threshold (days)
-- is_maintenance_heavy: maintenance-heavy profile (true/false)
-- maint_cycle_days: maintenance cycle length (days)
-- severity_score: issue severity score (unitless)
-- lateness_component, credits_component, trend_component, mitigator_component: model signals (unitless)
+Feature glossary (high level)
+- Recency + volume:
+  - `Recency_Orders_Days`, `Recency_MaintOrders_Days`, `Recency_Invoices_Days`, `OrderValue_90d`, `OrderFreq_90d`, `MaintOrderValue_90d`, `ProdOrderValue_90d`
+- Trend / change vs prior 90 days:
+  - `OrderValue_Prev90d`, `OrderValue_3m_Change`, `OrderValue_3m_ChangePct`,
+    `OrderFreq_Prev90d`, `OrderFreq_3m_Change`, `OrderFreq_3m_ChangePct`
+- Mix / profile:
+  - `ProdRatio_90d`, `MaintRatio_90d`, `IsProductHeavy_90d`, `IsMaintHeavy_90d`
+- AR / credits / DSO:
+  - `BackorderCount_180dPlus`, `UnpaidInv_OverTerms_Count`, `UnpaidInv_90plus_Count`,
+    `ARBucket_*_Count`, `DSO_OpenInvoices`, `CreditValue_90d`, `CreditCount_90d`
+- EoX risk:
+  - `Eox_MinDaysToLDOS`, `Risk_EoX_*`, `PredChurn_EoXExpired`, `Eox_Rev_*`, `Eox_Rev*Pct_*`,
+    `Eox_HasExpiredRevenue_12m`, `Eox_HasRiskRevenue_12m`, `Eox_MajorityExpired_12m`,
+    `Eox_SKU_Count*`, `EoxExpired_*`, `EoxRisk_*`
+- Rule flags:
+  - `ChurnIf_NoOrd90`, `ChurnIf_NoInv90`, `ChurnIf_NoMaintOrd90_WithinGrace`,
+    `PredChurn_Unpaid90plus`, `PredChurn_HighBackorders`, `KnownChurn_Effective`, `UpcomingChurn_90d`
 
 Contributing
 - See `CONTRIBUTING.md` for a short guide to setting up a dev environment and proposing changes.

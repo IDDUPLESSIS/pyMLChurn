@@ -1,8 +1,8 @@
 """
-Run script to fetch data from [SAP].[dbo].[CustomerChurnCadence_v1] and export to CSV.
+Run script to fetch data from [SAP].[chrn01].[v_train_dataset] and export churn predictions to CSV and/or SQL.
 
 Usage examples:
-  python pyMLChurn.py                    # TOP 1000, settings from .env
+  python pyMLChurn.py                    # TOP 1000 (or all rows), settings from .env
   python pyMLChurn.py --top 5000         # fetch 5000 rows
   python pyMLChurn.py --output out.csv   # custom output path
   python pyMLChurn.py --auth sql --username USER --password PASS
@@ -31,7 +31,7 @@ from pymlchurn.load_sql import create_table_if_missing, load_dataframe
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Fetch data from [SAP].[dbo].[CustomerChurnCadence_v1] and export to CSV.",
+        description="Fetch data from [SAP].[chrn01].[v_train_dataset], train churn model, and export predictions.",
     )
     p.add_argument("--top", type=int, default=None, help="Limit rows (TOP N). Default: all rows")
     p.add_argument(
@@ -41,7 +41,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Predictions CSV path (default: customer_churn_predictions.csv)",
     )
     p.add_argument("--raw-output", type=str, default=None, help="Optional: also save raw query CSV here")
-    p.add_argument("--target-col", type=str, default=target_column(), help="Target label column (default: churned_dynamic)")
+    p.add_argument("--target-col", type=str, default=target_column(), help="Target label column (default: Label_Churn_90d)")
     p.add_argument("--headers", choices=["friendly", "technical"], default="friendly", help="Column header style for output (default: friendly)")
     p.add_argument("--load-sql", action="store_true", help="Create table if missing and load predictions to SQL")
     p.add_argument("--load-schema", type=str, default="dbo", help="Target schema for SQL load (default: dbo)")
@@ -59,8 +59,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--no-encrypt", action="store_true", help="Disable TLS encryption")
     p.add_argument("--no-trust-cert", action="store_true", help="Set TrustServerCertificate=no")
-    p.add_argument("--sp-name", type=str, default="sp_build_customer_churn_cadence_v1", help="Stored procedure name to execute before query")
-    p.add_argument("--sp-schema", type=str, default="dbo", help="Stored procedure schema")
+    p.add_argument("--sp-name", type=str, default="sp_RunDailyChurnJob", help="Stored procedure name to execute before query (default: chrn01.sp_RunDailyChurnJob)")
+    p.add_argument("--sp-schema", type=str, default="chrn01", help="Stored procedure schema (default: chrn01)")
     p.add_argument("--sp-ttl-hours", type=int, default=24, help="Min hours between SP runs (default 24)")
     p.add_argument("--force-sp", action="store_true", help="Force running the stored procedure")
     p.add_argument("--skip-sp", action="store_true", help="Skip running the stored procedure")
@@ -328,6 +328,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     pred_df = pred_df.rename(columns=rename_map)
 
+    # Derive a simple monthly horizon column: predicted churn month for the 90d window
+    try:
+        as_of_ts = pd.to_datetime(pred_df.get("as_of_date_t0"), errors="coerce")
+        churn_month = (as_of_ts + pd.to_timedelta(90, unit="D")).dt.to_period("M").dt.to_timestamp()
+        pred_df["predicted_churn_month_t0+90d"] = churn_month.dt.strftime("%Y-%m-01")
+    except Exception:
+        pass
+
     # Apply header style
     if args.headers == "friendly":
         friendly_map = {
@@ -342,6 +350,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "predicted_churn_probability_90d_t0+90d": "Churn Probability (Next 90 Days)",
             "predicted_churn_probability_90d_pct_t0+90d": "Churn Probability % (Next 90 Days)",
             "predicted_churn_reason_t0": "Why At Risk (Predicted)",
+            "predicted_churn_month_t0+90d": "Predicted Churn Month (Next 90 Days)",
         }
         pred_df = pred_df.rename(columns=friendly_map)
 
@@ -357,6 +366,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "Churn Probability % (Next 90 Days)",
             "Churn Probability (Next 90 Days)",
             "Why At Risk (Predicted)",
+            "Predicted Churn Month (Next 90 Days)",
         ]
         ordered = [c for c in cols_pref if c in pred_df.columns] + [c for c in pred_df.columns if c not in cols_pref]
         pred_df = pred_df[ordered]
@@ -373,6 +383,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "predicted_churn_probability_90d_t0+90d",
             "predicted_churn_probability_90d_pct_t0+90d",
             "predicted_churn_reason_t0",
+            "predicted_churn_month_t0+90d",
         ]
         ordered = [c for c in cols_pref if c in pred_df.columns] + [c for c in pred_df.columns if c not in cols_pref]
         pred_df = pred_df[ordered]

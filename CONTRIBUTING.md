@@ -6,7 +6,7 @@ Thanks for your interest in improving pyMLChurn! This guide helps you set up a l
 Prerequisites
 - Windows with Microsoft ODBC Driver for SQL Server (17 or 18)
 - Python 3.9+
-- Access to a SQL Server with the `[SAP].[dbo].[CustomerChurnCadence_v1]` view and (optionally) the SP `[dbo].[sp_build_customer_churn_cadence_v1]`
+- Access to a SQL Server with the `[SAP].[chrn01].[v_train_dataset]` view and (optionally) the SP `[chrn01].[sp_RunDailyChurnJob]`
 
 Setup
 1) Clone and create a virtualenv
@@ -46,4 +46,3 @@ Security & secrets
 
 Questions
 - Open an issue or start a discussion in the repo
-
