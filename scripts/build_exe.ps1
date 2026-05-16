@@ -5,6 +5,15 @@
 
 $ErrorActionPreference = 'Stop'
 
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$rootCandidate = Split-Path -Parent $scriptDir
+if (Test-Path (Join-Path $rootCandidate 'pyMLChurn.py')) {
+  $root = $rootCandidate
+} else {
+  $root = $scriptDir
+}
+Set-Location $root
+
 Write-Host '[build] Ensuring venv at .venv_build'
 if (-not (Test-Path .\.venv_build\Scripts\python.exe)) {
   python -m venv .venv_build

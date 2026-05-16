@@ -1,3 +1,6 @@
+﻿SOURCE_FILE: sql\\sp_build_customer_churn_cadence_v1
+EXPORT_NOTE: Original file copied verbatim below.
+
 USE [SAP]
 GO
 
@@ -21,8 +24,8 @@ to chrn01.CustomerChurnCadence_v1 (TRUNCATE + INSERT), and optionally returns ro
 What the proc does (high level)
 -------------------------------
 1) Sources
-   - Invoices: SAP.dbo.ZSD_REPBILL  â†’ positive/negative signed net values.
-   - Orders:   SAP.dbo.ZSD_REPORD_ORDER_INTAKE â†’ planned revenue normalized
+   - Invoices: SAP.dbo.ZSD_REPBILL  Ã¢â€ â€™ positive/negative signed net values.
+   - Orders:   SAP.dbo.ZSD_REPORD_ORDER_INTAKE Ã¢â€ â€™ planned revenue normalized
      to POSITIVE for sales (report convention is negative; we flip sign).
 
 2) Snapshots (t0)
@@ -33,7 +36,7 @@ What the proc does (high level)
    - Recency: days since last positive posted invoice strictly before t0.
    - Cadence stats from non-zero inter-purchase gaps within a lookback window:
        * median_gap_days, p90_gap_days, coefficient of variation (cv_gap).
-   - Renewal awareness: flags if t0 is within Â±@GraceDays of contract start/end.
+   - Renewal awareness: flags if t0 is within Ã‚Â±@GraceDays of contract start/end.
    - Revenue windows (lookback): rev_180d, returns_90d, invoices_90d, credits_90d.
    - Pipeline proxies: orders_pos_30d / orders_neg_30d (planned revenue),
      backorder_qty_30d (qty created within prior 30 days).
@@ -42,16 +45,16 @@ What the proc does (high level)
      credit_notes_ma3 (= 3-month moving avg of credit note counts).
 
 4) Maintenance vs Technology mix & cadence
-   - Heuristic by order number length: LEN=8 â†’ maintenance, LEN=6 â†’ technology.
+   - Heuristic by order number length: LEN=8 Ã¢â€ â€™ maintenance, LEN=6 Ã¢â€ â€™ technology.
    - Maintenance cycle is inferred from pay terms (monthly/quarterly/annual)
      or from invoice gap median when terms absent.
-   - Maintenance-heavy flag if maint_orders_180d â‰¥ tech_orders_180d and > 0.
+   - Maintenance-heavy flag if maint_orders_180d Ã¢â€°Â¥ tech_orders_180d and > 0.
 
 5) Labels
    - churned_hard90: 1 if NO positive posted invoice in the 90 days AFTER t0.
    - churned_dynamic: 1 if recency_days > threshold_days, where threshold_days:
-       * Maintenance-heavy â†’ round(1.2 Ã— maint_cycle_days) + renewal grace.
-       * Otherwise â†’ max(p90_gap_days, @K_Mult Ã— median_gap_days) + grace if any.
+       * Maintenance-heavy Ã¢â€ â€™ round(1.2 Ãƒâ€” maint_cycle_days) + renewal grace.
+       * Otherwise Ã¢â€ â€™ max(p90_gap_days, @K_Mult Ãƒâ€” median_gap_days) + grace if any.
        * Global floor: @MinThresholdDays.
 
 6) Human-readable reasons
@@ -59,15 +62,15 @@ What the proc does (high level)
      flagged (e.g., RECENCY_GT_XXD | NO_INV_90D | RETURNS_90D | SPEND_DOWN(...)).
    - churn_reason_hard90 explains the hard-90 label when applicable.
 
-7) Severity score (0â€“100)
+7) Severity score (0Ã¢â‚¬â€œ100)
    - Rank-ordering signal within the churned cohort, combining:
        * lateness_component     = sigmoid( (recency - threshold) / threshold ).
        * credits_component      = clamp( returns_90d / |rev_180d|, 0..1 ).
-       * trend_component        = additive penalties for â‰¤ âˆ’30% drops on 3m/6m/YoY.
+       * trend_component        = additive penalties for Ã¢â€°Â¤ Ã¢Ë†â€™30% drops on 3m/6m/YoY.
        * mitigator_component    = positive evidence (orders_pos_30d>0, renewal_grace)
                                   reduces severity.
-     Raw score = 0.6*lateness + 0.2*credits + 0.2*trend âˆ’ 0.15*mitigator,
-     then clamped to [0,1] and scaled to 0â€“100.
+     Raw score = 0.6*lateness + 0.2*credits + 0.2*trend Ã¢Ë†â€™ 0.15*mitigator,
+     then clamped to [0,1] and scaled to 0Ã¢â‚¬â€œ100.
 
 Key Parameters
 --------------
@@ -568,7 +571,7 @@ BEGIN
     /* M) Truncate target */
     TRUNCATE TABLE chrn01.CustomerChurnCadence_v1;
 
-    /* N) Insert final rows â€” severity computed via CROSS APPLY (fixes 4145) */
+    /* N) Insert final rows Ã¢â‚¬â€ severity computed via CROSS APPLY (fixes 4145) */
     ;WITH final_rows AS (
       SELECT
         r.customer_id, r.t0,
@@ -758,6 +761,7 @@ BEGIN
   END CATCH
 END
 GO
+
 
 
 

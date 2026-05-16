@@ -6,7 +6,7 @@ Thanks for your interest in improving pyMLChurn! This guide helps you set up a l
 Prerequisites
 - Windows with Microsoft ODBC Driver for SQL Server (17 or 18)
 - Python 3.9+
-- Access to a SQL Server with the `[SAP].[chrn01].[v_train_dataset]` view and (optionally) the SP `[chrn01].[sp_RunDailyChurnJob]`
+- Access to a SQL Server with the `[SAP].[chrn01].[v_train_dataset]` view
 
 Setup
 1) Clone and create a virtualenv
@@ -19,18 +19,18 @@ Setup
    - Copy `.env.example` to `.env` and set `MSSQL_SERVER`, `MSSQL_DATABASE`, and authentication
 
 Run locally
-- Script: `python pyMLChurn.py --output predictions.csv --raw-output raw.csv --keep-csv`
-- Load to SQL: add `--load-sql --load-table CustomerChurnPredictions`
+- Script (loads to SQL): `python pyMLChurn.py`
+- Load mode: `--load-if-exists append` to append instead of replace
 - Connectivity only: `python pyMLChurn.py --check-only`
 
 Executable (optional)
-- Build: `.\build_exe.ps1`
+- Build: `.\scripts\build_exe.ps1`
 - Run EXE: `dist\pyMLChurn\pyMLChurn.exe` (auto loads to SQL when run without flags)
 
 Coding guidelines
 - Keep changes focused and minimal
 - Match existing style and naming
-- Favor friendly headers for user-facing CSV; technical headers remain available
+- Favor friendly headers for user-facing outputs; technical headers remain available
 - Avoid committing generated artifacts (`*.csv`, `dist/`, `build/`, `.venv_build/`)
 
 Submitting changes

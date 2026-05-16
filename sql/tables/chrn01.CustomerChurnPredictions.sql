@@ -1,4 +1,4 @@
--- Placeholder: table structure for [dbo].[CustomerChurnPredictions]
+-- Placeholder: table structure for [chrn01].[CustomerChurnPredictions]
 -- Copy your production DDL here.
 
 /*
@@ -16,4 +16,5 @@ Suggested columns (align with app output)
 - WhyAtRiskPredicted NVARCHAR(MAX)
 - CreatedOn DATETIME
 */
+
 

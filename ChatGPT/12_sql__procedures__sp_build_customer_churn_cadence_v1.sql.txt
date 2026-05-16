@@ -1,3 +1,6 @@
+﻿SOURCE_FILE: sql\\procedures\\sp_build_customer_churn_cadence_v1.sql
+EXPORT_NOTE: Original file copied verbatim below.
+
 -- Placeholder: stored procedure that builds/refreshes [chrn01].[CustomerChurnCadence_v1]
 -- Copy your production DDL/DML here.
 
@@ -7,5 +10,6 @@ Expected purpose
 - Name: [chrn01].[sp_build_customer_churn_cadence_v1]
 - Output object: [chrn01].[CustomerChurnCadence_v1]
 */
+
 
 

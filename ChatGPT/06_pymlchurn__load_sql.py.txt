@@ -1,3 +1,6 @@
+﻿SOURCE_FILE: pymlchurn\\load_sql.py
+EXPORT_NOTE: Original file copied verbatim below.
+
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -137,3 +140,4 @@ def load_dataframe(cfg: Config, df: pd.DataFrame, schema: str, table: str, if_ex
         dtype=dtypes,
         method=None,
     )
+

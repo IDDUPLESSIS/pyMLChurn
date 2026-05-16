@@ -1,0 +1,3 @@
+﻿SQL View Discovery Result
+No CREATE VIEW or ALTER VIEW statements were found in the sql folder at export time.
+If views exist elsewhere, add them as additional text files in this folder.

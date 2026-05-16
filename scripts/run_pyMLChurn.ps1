@@ -1,6 +1,5 @@
 Param(
   [int]$top = 1000,
-  [string]$output,
   [ValidateSet('windows','sql')][string]$auth,
   [string]$username,
   [string]$password,
@@ -13,8 +12,8 @@ $ErrorActionPreference = 'Stop'
 
 function Ensure-Venv {
   param([string]$Root)
-  $venvBuild = Join-Path $Root '.venv_build/ScriptS/python.exe'
-  $venv = Join-Path $Root '.venv/ScriptS/python.exe'
+  $venvBuild = Join-Path $Root '.venv_build/Scripts/python.exe'
+  $venv = Join-Path $Root '.venv/Scripts/python.exe'
 
   if (Test-Path $venvBuild) { return (Join-Path $Root '.venv_build') }
   if (Test-Path $venv) { return (Join-Path $Root '.venv') }
@@ -29,7 +28,13 @@ function Ensure-Venv {
 }
 
 try {
-  $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+  $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+  $rootCandidate = Split-Path -Parent $scriptDir
+  if (Test-Path (Join-Path $rootCandidate 'pyMLChurn.py')) {
+    $root = $rootCandidate
+  } else {
+    $root = $scriptDir
+  }
   Set-Location $root
 
   $venvDir = Ensure-Venv -Root $root
@@ -48,7 +53,6 @@ try {
 
   $argsList = @()
   if ($top) { $argsList += @('--top', $top) }
-  if ($output) { $argsList += @('--output', $output) }
   if ($auth) { $argsList += @('--auth', $auth) }
   if ($username) { $argsList += @('--username', $username) }
   if ($password) { $argsList += @('--password', $password) }

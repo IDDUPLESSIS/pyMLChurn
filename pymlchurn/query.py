@@ -1,24 +1,17 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from typing import Optional, List
+from typing import List, Optional
 
-# Column names as they appear in your SQL view chrn01.v_train_dataset
+# Column names as they appear in chrn01.v_train_dataset
 CUSTOMER_ID_COL = "CustomerId"
-DATE_COL = "as_of_date"  # will be an alias of SnapshotDate
+DATE_COL = "as_of_date"  # alias for SnapshotDate
 
 
 def feature_columns() -> List[str]:
-    """
-    Feature list must exactly match the columns exposed by chrn01.v_train_dataset
-    (excluding label columns).
-    """
     return [
-        # Core recency features
         "Recency_Orders_Days",
         "Recency_MaintOrders_Days",
         "Recency_Invoices_Days",
-
-        # Basic 90d behaviour and mix (level + change)
         "OrderValue_90d",
         "OrderValue_Prev90d",
         "OrderValue_3m_Change",
@@ -33,8 +26,6 @@ def feature_columns() -> List[str]:
         "MaintRatio_90d",
         "IsProductHeavy_90d",
         "IsMaintHeavy_90d",
-
-        # Risk / signal flags and counts
         "BackorderCount_180dPlus",
         "UnpaidInv_OverTerms_Count",
         "UnpaidInv_90plus_Count",
@@ -49,8 +40,6 @@ def feature_columns() -> List[str]:
         "ReturnInvCount_90d",
         "CreditValue_90d",
         "CreditCount_90d",
-
-        # EoX / LDOS risk and revenue mix
         "Eox_MinDaysToLDOS",
         "Risk_EoX_12m",
         "Risk_EoX_6m",
@@ -70,8 +59,7 @@ def feature_columns() -> List[str]:
         "EoxRisk_NoMaintRenewal",
         "EoxExpired_UnpaidInv90plus",
         "EoxExpired_CreditSpike90d",
-
-        # Rule-based churn flags (good engineered features)
+        "MaintContractActive",
         "ChurnIf_NoOrd90",
         "ChurnIf_NoInv90",
         "ChurnIf_NoMaintOrd90_WithinGrace",
@@ -80,13 +68,87 @@ def feature_columns() -> List[str]:
     ]
 
 
+def direct_rule_feature_columns() -> List[str]:
+    return [
+        "ChurnIf_NoOrd90",
+        "ChurnIf_NoInv90",
+        "ChurnIf_NoMaintOrd90_WithinGrace",
+    ]
+
+
 def target_column(default: str = "Label_Churn_90d") -> str:
-    """
-    Default supervised target. We start with Label_Churn_90d to keep the
-    semantics consistent with ml.py, which currently assumes a '90d' horizon
-    in its output column names.
-    """
     return default
+
+
+def _label_maturity_days(label_col: str) -> int:
+    lookup = {
+        "Label_Churn_90d": 90,
+        "Label_Churn_180d": 180,
+        "Label_Churn_365d": 365,
+    }
+    return lookup.get(label_col, 90)
+
+
+def _safe_sql_date_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _top_clause(top: Optional[int]) -> str:
+    return f"TOP ({int(top)}) " if (top is not None and int(top) > 0) else ""
+
+
+def _shared_select_columns(target: Optional[str] = None, include_target: bool = False) -> List[str]:
+    cols: List[str] = [
+        f"[{CUSTOMER_ID_COL}]",
+        "CONVERT(varchar(10), [SnapshotDate], 23) AS [as_of_date]",
+    ]
+    cols.extend([f"[{c}]" for c in feature_columns()])
+    if include_target:
+        cols.append(f"[{target or target_column()}]")
+    return cols
+
+
+def churn_training_query(
+    target: Optional[str] = None,
+    top: Optional[int] = None,
+    train_cutoff_date: Optional[str] = None,
+) -> str:
+    target_col = target or target_column()
+    maturity_days = _label_maturity_days(target_col)
+    select_cols = ",\n      ".join(_shared_select_columns(target=target_col, include_target=True))
+
+    if train_cutoff_date:
+        cutoff_expr = f"CAST('{_safe_sql_date_literal(train_cutoff_date)}' AS date)"
+    else:
+        cutoff_expr = f"DATEADD(day, -{maturity_days}, CAST(GETDATE() AS date))"
+
+    return f"""
+SELECT {_top_clause(top)}
+      {select_cols}
+FROM [SAP].[chrn01].[v_train_dataset]
+WHERE [{target_col}] IS NOT NULL
+  AND [SnapshotDate] IS NOT NULL
+  AND CAST([SnapshotDate] AS date) <= {cutoff_expr};
+"""
+
+
+def churn_scoring_query(
+    score_as_of: Optional[str] = None,
+    top: Optional[int] = None,
+) -> str:
+    select_cols = ",\n      ".join(_shared_select_columns(include_target=False))
+    if score_as_of:
+        score_expr = f"CAST('{_safe_sql_date_literal(score_as_of)}' AS date)"
+    else:
+        score_expr = "(SELECT MAX(CAST([SnapshotDate] AS date)) FROM [SAP].[chrn01].[v_train_dataset])"
+
+    return f"""
+SELECT {_top_clause(top)}
+      {select_cols}
+FROM [SAP].[chrn01].[v_train_dataset]
+WHERE [SnapshotDate] IS NOT NULL
+  AND CAST([SnapshotDate] AS date) = {score_expr};
+"""
 
 
 def churn_query(
@@ -95,28 +157,9 @@ def churn_query(
     target: Optional[str] = None,
 ) -> str:
     """
-    Minimal SELECT from chrn01.v_train_dataset with only the columns needed
-    by the ML pipeline. SnapshotDate is exposed to Python as 'as_of_date'.
+    Deprecated compatibility helper.
+    Prefer churn_training_query(...) and churn_scoring_query(...) explicitly.
     """
-    feat_cols = feature_columns()
-
-    # Always pull CustomerId + SnapshotDate (aliased to as_of_date)
-    parts: List[str] = [
-        "[CustomerId]",
-        "CONVERT(varchar(10), [SnapshotDate], 23) AS [as_of_date]",
-    ]
-    # Feature columns
-    parts += [f"[{c}]" for c in feat_cols]
-
-    # Optional label
     if include_label:
-        parts.append(f"[{target or target_column()}]")
-
-    select_cols = ",\n      ".join(parts)
-    top_clause = f"TOP ({int(top)}) " if (top is not None and int(top) > 0) else ""
-
-    return f"""
-SELECT {top_clause}
-      {select_cols}
-FROM [SAP].[chrn01].[v_train_dataset];
-"""
+        return churn_training_query(target=target, top=top, train_cutoff_date=None)
+    return churn_scoring_query(score_as_of=None, top=top)

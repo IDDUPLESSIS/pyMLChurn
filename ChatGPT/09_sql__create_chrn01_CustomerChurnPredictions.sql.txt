@@ -1,13 +1,16 @@
-﻿-- Creates the destination table used by pyMLChurn loads
+﻿SOURCE_FILE: sql\\create_chrn01_CustomerChurnPredictions.sql
+EXPORT_NOTE: Original file copied verbatim below.
+
+-- Creates the destination table used by pyMLChurn loads
 -- Default load mode in the app is REPLACE (overwrites table each run)
 
-IF OBJECT_ID(N'[dbo].[CustomerChurnPredictions]', N'U') IS NOT NULL
+IF OBJECT_ID(N'[chrn01].[CustomerChurnPredictions]', N'U') IS NOT NULL
 BEGIN
-    DROP TABLE [dbo].[CustomerChurnPredictions];
+    DROP TABLE [chrn01].[CustomerChurnPredictions];
 END
 GO
 
-CREATE TABLE [dbo].[CustomerChurnPredictions]
+CREATE TABLE [chrn01].[CustomerChurnPredictions]
 (
     [CustomerId]                     INT            NULL,
     [SnapshotDate]                   DATE           NULL,
@@ -26,5 +29,7 @@ GO
 
 -- Helpful index for lookups by customer + snapshot
 CREATE NONCLUSTERED INDEX IX_CustomerChurnPredictions_Customer_Snapshot
-ON [dbo].[CustomerChurnPredictions] ([CustomerId], [SnapshotDate]);
+ON [chrn01].[CustomerChurnPredictions] ([CustomerId], [SnapshotDate]);
 GO
+
+

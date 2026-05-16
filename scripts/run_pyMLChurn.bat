@@ -1,8 +1,13 @@
 @echo off
 setlocal
 
-REM Ensure we are in the repo root (this script's directory)
-pushd "%~dp0"
+REM Ensure we are in the repo root (supports script in root or scripts\)
+set "SCRIPT_DIR=%~dp0"
+if exist "%SCRIPT_DIR%..\pyMLChurn.py" (
+  pushd "%SCRIPT_DIR%.."
+) else (
+  pushd "%SCRIPT_DIR%"
+)
 
 REM Ensure .env exists; if not, copy from .env.example
 if not exist ".env" (

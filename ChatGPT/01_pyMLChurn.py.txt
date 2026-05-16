@@ -1,0 +1,769 @@
+﻿SOURCE_FILE: pyMLChurn.py
+EXPORT_NOTE: Original file copied verbatim below.
+
+"""
+Run script to fetch data from [SAP].[chrn01].[v_train_dataset] and load churn
+predictions directly to SQL.
+
+Usage examples:
+  python pyMLChurn.py                            # settings from .env, loads to SQL
+  python pyMLChurn.py --top 5000                 # fetch 5000 rows and load to SQL
+  python pyMLChurn.py --load-if-exists append    # append instead of replace
+  python pyMLChurn.py --auth sql --username USER --password PASS
+
+Environment defaults are loaded from .env (see .env.example).
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import re
+from pathlib import Path
+import os
+import time
+from datetime import datetime
+from typing import Optional
+import sys
+from dotenv import find_dotenv
+
+from pymlchurn.config import Config
+from pymlchurn.db import query_dataframe, pick_driver, connectivity_info
+from pymlchurn.query import churn_query, feature_columns, target_column, CUSTOMER_ID_COL, DATE_COL
+from pymlchurn.load_sql import create_table_if_missing, load_dataframe
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Fetch data from [SAP].[chrn01].[v_train_dataset], train churn model, and load predictions to SQL.",
+    )
+    p.add_argument("--top", type=int, default=None, help="Limit rows (TOP N). Default: all rows")
+    p.add_argument("--target-col", type=str, default=target_column(), help="Target label column (default: Label_Churn_90d)")
+    p.add_argument("--headers", choices=["friendly", "technical"], default="friendly", help="Column header style for output (default: friendly)")
+    p.add_argument("--load-schema", type=str, default="chrn01", help="Target schema for SQL load (default: chrn01)")
+    p.add_argument("--load-table", type=str, default="CustomerChurnPredictions", help="Target table name for SQL load")
+    p.add_argument("--load-if-exists", choices=["append","replace","fail"], default="replace", help="Behavior if table exists (default: replace)")
+    p.add_argument("--auth", choices=["windows", "sql"], default=None, help="Override MSSQL_AUTH")
+    p.add_argument("--username", type=str, default=None, help="SQL login username (if --auth sql)")
+    p.add_argument("--password", type=str, default=None, help="SQL login password (if --auth sql)")
+    p.add_argument(
+        "--driver",
+        type=str,
+        default=None,
+        help="ODBC driver name (e.g. 'ODBC Driver 18 for SQL Server')",
+    )
+    p.add_argument("--no-encrypt", action="store_true", help="Disable TLS encryption")
+    p.add_argument("--no-trust-cert", action="store_true", help="Set TrustServerCertificate=no")
+    p.add_argument("--check", action="store_true", help="Run connectivity check before querying")
+    p.add_argument("--check-only", action="store_true", help="Only run connectivity check and exit")
+    p.add_argument("--keep-all-rows", action="store_true", help="Do not deduplicate by latest as_of_date per customer")
+    p.add_argument("--as-of", type=str, default=None, help="Filter to rows with this as_of date (YYYY-MM-DD)")
+    p.add_argument(
+        "--metrics-log-file", type=str, default=None, help="Append model metrics history to this text file (default: pyMLChurn_model_metrics_history.txt in run folder)"
+    )
+    return p.parse_args(argv)
+
+
+def build_config(args: argparse.Namespace) -> Config:
+    cfg = Config.from_env()
+    if args.auth:
+        cfg.auth = args.auth
+    if args.username is not None:
+        cfg.username = args.username
+    if args.password is not None:
+        cfg.password = args.password
+    if args.driver is not None:
+        cfg.odbc_driver = args.driver
+    if args.no_encrypt:
+        cfg.encrypt = False
+    if args.no_trust_cert:
+        cfg.trust_server_certificate = False
+    return cfg
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    log_fh = None
+    orig_out = None
+    orig_err = None
+    # Set up a persistent log file next to the EXE when frozen,
+    # otherwise use the current working directory
+    try:
+        if getattr(sys, 'frozen', False):
+            log_dir = Path(sys.executable).resolve().parent
+        else:
+            log_dir = Path.cwd()
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log_dir = Path.cwd()
+    log_file = str(log_dir / f"pyMLChurn_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    def _cleanup_logs() -> None:
+        nonlocal log_file, log_fh, orig_out, orig_err
+        try:
+            if orig_out is not None:
+                sys.stdout = orig_out
+            if orig_err is not None:
+                sys.stderr = orig_err
+        except Exception:
+            pass
+        try:
+            if log_fh:
+                log_fh.flush()
+                log_fh.close()
+        except Exception:
+            pass
+        try:
+            if log_file:
+                os.remove(log_file)
+        except Exception:
+            pass
+        try:
+            if log_file:
+                latest = Path(log_file).with_name("pyMLChurn_latest.log")
+                os.remove(str(latest))
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_logs)
+    # Tee stdout/stderr to the log file to capture all prints
+    try:
+        class _Tee:
+            def __init__(self, primary, fh):
+                self.primary = primary
+                self.fh = fh
+            def write(self, s):
+                try:
+                    if self.primary:
+                        self.primary.write(s)
+                except Exception:
+                    pass
+                try:
+                    self.fh.write(s)
+                except Exception:
+                    pass
+            def flush(self):
+                try:
+                    if self.primary:
+                        self.primary.flush()
+                except Exception:
+                    pass
+                try:
+                    self.fh.flush()
+                except Exception:
+                    pass
+        _fh = open(log_file, 'a', encoding='utf-8', buffering=1)
+        log_fh = _fh
+        orig_out, orig_err = sys.stdout, sys.stderr
+        sys.stdout = _Tee(orig_out, _fh)
+        sys.stderr = _Tee(orig_err, _fh)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Logging initialized -> {log_file}")
+    except Exception:
+        pass
+    def ts() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def log(msg: str) -> None:
+        nonlocal log_file
+        line = f"[{ts()}] {msg}"
+        print(line)
+        # Attempt primary log; on failure, fall back to Documents
+        wrote = False
+        try:
+            if log_file:
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+                wrote = True
+        except Exception:
+            wrote = False
+        if not wrote:
+            try:
+                fallback_dir = Path.home() / "Documents" / "pyMLChurn"
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                fb = str(fallback_dir / f"pyMLChurn_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+                with open(fb, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+                log_file = fb
+            except Exception:
+                pass
+        # Keep a simple rolling latest log next to the chosen log directory
+        try:
+            latest = Path(log_file).with_name("pyMLChurn_latest.log") if log_file else None
+            if latest:
+                with open(latest, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
+    def append_model_metrics_history(predictions_df, prediction_value_type: Optional[str] = None) -> None:
+        metrics = getattr(predictions_df, "attrs", {}).get("model_metrics", None)
+        if not isinstance(metrics, dict):
+            log("Model metrics were not available to persist.")
+            return
+
+        try:
+            import shutil
+
+            readable_path = Path(args.metrics_log_file).expanduser() if args.metrics_log_file else (log_dir / "pyMLChurn_model_metrics_history.txt")
+            readable_path.parent.mkdir(parents=True, exist_ok=True)
+            if readable_path.suffix.lower() == ".tsv":
+                tsv_path = readable_path
+                readable_path = readable_path.with_name(readable_path.stem + "_readable.txt")
+            elif readable_path.suffix:
+                tsv_path = readable_path.with_suffix(".tsv")
+            else:
+                tsv_path = readable_path.with_name(readable_path.name + ".tsv")
+
+            headers = [
+                "run_timestamp",
+                "model_mode",
+                "train_label_source",
+                "evaluation_source",
+                "metrics_available",
+                "metric_status",
+                "prediction_value_type",
+                "target_col",
+                "n_rows",
+                "actual_positives",
+                "predicted_positives",
+                "predicted_positive_rate_pct",
+                "avg_prediction_value",
+                "p90_prediction_value",
+                "accuracy",
+                "precision",
+                "recall",
+                "f1",
+                "roc_auc",
+                "brier_score",
+                "tp",
+                "tn",
+                "fp",
+                "fn",
+            ]
+            metric_value_headers = {
+                "actual_positives",
+                "accuracy",
+                "precision",
+                "recall",
+                "f1",
+                "roc_auc",
+                "brier_score",
+                "tp",
+                "tn",
+                "fp",
+                "fn",
+            }
+
+            def clean(v: object) -> str:
+                if v is None:
+                    return "N/A"
+                s = str(v).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+                return s if s else "N/A"
+
+            def fmt(v: object, decimals: Optional[int] = None, pct: bool = False) -> str:
+                if v is None:
+                    return "N/A"
+                try:
+                    x = float(v)
+                    if decimals is not None:
+                        out = f"{x:.{decimals}f}"
+                    else:
+                        out = str(x)
+                    return f"{out}%" if pct else out
+                except Exception:
+                    return clean(v)
+
+            def get_existing_rows(path: Path):
+                existing_headers = None
+                existing_rows = []
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        lines = [ln.rstrip("\n") for ln in f]
+                    if lines:
+                        existing_headers = lines[0].split("\t") if lines[0] else []
+                        existing_rows = lines[1:]
+                return existing_headers, existing_rows
+
+            def ensure_tsv_schema(path: Path) -> None:
+                existing_headers, existing_rows = get_existing_rows(path)
+                if existing_headers == headers:
+                    return
+
+                if path.exists() and existing_headers is not None:
+                    backup = path.with_name(path.name + f".bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                    shutil.copy2(path, backup)
+
+                migrated_lines = ["\t".join(headers)]
+                if existing_headers:
+                    for row_line in existing_rows:
+                        if not row_line.strip():
+                            continue
+                        parts = row_line.split("\t")
+                        if len(parts) < len(existing_headers):
+                            parts += [""] * (len(existing_headers) - len(parts))
+                        old_map = {existing_headers[i]: parts[i] for i in range(len(existing_headers))}
+                        migrated = [clean(old_map.get(h, "N/A")) for h in headers]
+                        migrated_lines.append("\t".join(migrated))
+
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(migrated_lines) + "\n")
+
+                if existing_headers is not None:
+                    log(f"Metrics TSV schema updated: {path}")
+
+            def build_readable_block(row_map: dict) -> str:
+                value_type = clean(row_map.get("prediction_value_type", "N/A")).lower()
+                if value_type == "risk_score_proxy":
+                    score_label = "Risk score"
+                elif value_type == "churn_probability_estimate":
+                    score_label = "Churn probability"
+                else:
+                    score_label = "Prediction value"
+
+                lines = [
+                    "=" * 72,
+                    f"Run Timestamp: {clean(row_map.get('run_timestamp'))}",
+                    f"Model Mode: {clean(row_map.get('model_mode'))}",
+                    f"Train Label Source: {clean(row_map.get('train_label_source'))}",
+                    f"Evaluation Source: {clean(row_map.get('evaluation_source'))}",
+                    f"Metric Status: {clean(row_map.get('metric_status'))}",
+                    f"Prediction Value Type: {clean(row_map.get('prediction_value_type'))}",
+                    f"Target Column: {clean(row_map.get('target_col'))}",
+                    "",
+                    "Scoring Summary:",
+                    f"  Rows Scored: {clean(row_map.get('n_rows'))}",
+                    f"  Predicted Positives: {clean(row_map.get('predicted_positives'))}",
+                    f"  Predicted Positive Rate: {fmt(row_map.get('predicted_positive_rate_pct'), 2, pct=True)}",
+                    f"  Average {score_label.title()}: {fmt(row_map.get('avg_prediction_value'), 6)}",
+                    f"  P90 {score_label.title()}: {fmt(row_map.get('p90_prediction_value'), 6)}",
+                    "",
+                    "Label-Based Metrics:",
+                ]
+
+                metrics_available_local = clean(row_map.get("metrics_available", "False")).lower() in {"true", "1", "yes"}
+                if not metrics_available_local:
+                    lines.append(f"  Unavailable: {clean(row_map.get('metric_status'))}")
+                else:
+                    lines.extend(
+                        [
+                            f"  Actual Positives: {clean(row_map.get('actual_positives'))}",
+                            f"  Accuracy: {fmt(row_map.get('accuracy'), 6)}",
+                            f"  Precision: {fmt(row_map.get('precision'), 6)}",
+                            f"  Recall: {fmt(row_map.get('recall'), 6)}",
+                            f"  F1: {fmt(row_map.get('f1'), 6)}",
+                            f"  ROC AUC: {fmt(row_map.get('roc_auc'), 6)}",
+                            f"  Brier Score: {fmt(row_map.get('brier_score'), 6)}",
+                            f"  TP: {clean(row_map.get('tp'))}",
+                            f"  TN: {clean(row_map.get('tn'))}",
+                            f"  FP: {clean(row_map.get('fp'))}",
+                            f"  FN: {clean(row_map.get('fn'))}",
+                        ]
+                    )
+                return "\n".join(lines)
+
+            # Migrate legacy tab-delimited .txt file to readable format once.
+            if readable_path.exists():
+                try:
+                    with open(readable_path, "r", encoding="utf-8") as f:
+                        preview = f.readline().strip()
+                    if preview == "\t".join(headers):
+                        backup = readable_path.with_name(readable_path.name + f".bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                        shutil.copy2(readable_path, backup)
+                        with open(readable_path, "r", encoding="utf-8") as f:
+                            lines = [ln.rstrip("\n") for ln in f]
+                        migrated_blocks = []
+                        old_headers = lines[0].split("\t") if lines else []
+                        for row_line in lines[1:]:
+                            if not row_line.strip():
+                                continue
+                            parts = row_line.split("\t")
+                            if len(parts) < len(old_headers):
+                                parts += [""] * (len(old_headers) - len(parts))
+                            old_row = {old_headers[i]: clean(parts[i]) for i in range(len(old_headers))}
+                            migrated_blocks.append(build_readable_block(old_row))
+                        with open(readable_path, "w", encoding="utf-8") as f:
+                            if migrated_blocks:
+                                f.write("\n\n".join(migrated_blocks) + "\n")
+                        log(f"Metrics history converted to readable format: {readable_path}")
+                except Exception:
+                    pass
+
+            metrics_available = bool(metrics.get("metrics_available", False))
+            evaluation_source = metrics.get("evaluation_source")
+            metric_status = "ok" if metrics_available else clean(evaluation_source or "unavailable")
+
+            if prediction_value_type:
+                value_type = prediction_value_type
+            elif hasattr(predictions_df, "columns") and "prediction_value_type" in predictions_df.columns:
+                try:
+                    value_type = clean(predictions_df["prediction_value_type"].iloc[0])
+                except Exception:
+                    value_type = "N/A"
+            else:
+                value_type = "N/A"
+
+            # Always persist basic run stats, even when true-label metrics are unavailable.
+            n_rows_fallback = int(len(predictions_df)) if hasattr(predictions_df, "__len__") else None
+            predicted_positives_fallback = None
+            predicted_positive_rate_pct = None
+            avg_prediction_value = None
+            p90_prediction_value = None
+            try:
+                if hasattr(predictions_df, "columns"):
+                    import pandas as pd
+
+                    if "predicted_churn_90d" in predictions_df.columns:
+                        pred_bits = pd.to_numeric(predictions_df["predicted_churn_90d"], errors="coerce").fillna(0).astype(int)
+                        predicted_positives_fallback = int(pred_bits.sum())
+                        if len(pred_bits) > 0:
+                            predicted_positive_rate_pct = round(float(pred_bits.mean() * 100.0), 2)
+
+                    score_col = None
+                    for c in [
+                        "predicted_churn_probability_90d",
+                        "predicted_churn_score_90d",
+                        "predicted_churn_probability_90d_pct",
+                        "predicted_churn_score_90d_pct",
+                    ]:
+                        if c in predictions_df.columns:
+                            score_col = c
+                            break
+
+                    if score_col:
+                        scores = pd.to_numeric(predictions_df[score_col], errors="coerce")
+                        if score_col.endswith("_pct"):
+                            scores = scores / 100.0
+                        scores = scores.dropna().clip(lower=0.0, upper=1.0)
+                        if len(scores) > 0:
+                            avg_prediction_value = round(float(scores.mean()), 6)
+                            p90_prediction_value = round(float(scores.quantile(0.90)), 6)
+            except Exception:
+                pass
+
+            metric_n_rows = metrics.get("n_rows", None)
+            if metric_n_rows is None and n_rows_fallback is not None:
+                metric_n_rows = n_rows_fallback
+
+            metric_predicted_positives = metrics.get("predicted_positives", None)
+            if metric_predicted_positives is None:
+                metric_predicted_positives = predicted_positives_fallback
+
+            if predicted_positive_rate_pct is None and metric_predicted_positives is not None and metric_n_rows:
+                try:
+                    predicted_positive_rate_pct = round(float(metric_predicted_positives) * 100.0 / float(metric_n_rows), 2)
+                except Exception:
+                    predicted_positive_rate_pct = None
+
+            row = {
+                "run_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "model_mode": metrics.get("model_mode", "N/A"),
+                "train_label_source": metrics.get("train_label_source", "N/A"),
+                "evaluation_source": evaluation_source,
+                "metrics_available": metrics_available,
+                "metric_status": metric_status,
+                "prediction_value_type": value_type,
+                "target_col": metrics.get("target_col", "N/A"),
+                "n_rows": metric_n_rows,
+                "actual_positives": metrics.get("actual_positives", None),
+                "predicted_positives": metric_predicted_positives,
+                "predicted_positive_rate_pct": predicted_positive_rate_pct,
+                "avg_prediction_value": avg_prediction_value,
+                "p90_prediction_value": p90_prediction_value,
+                "accuracy": metrics.get("accuracy", None),
+                "precision": metrics.get("precision", None),
+                "recall": metrics.get("recall", None),
+                "f1": metrics.get("f1", None),
+                "roc_auc": metrics.get("roc_auc", None),
+                "brier_score": metrics.get("brier_score", None),
+                "tp": metrics.get("tp", None),
+                "tn": metrics.get("tn", None),
+                "fp": metrics.get("fp", None),
+                "fn": metrics.get("fn", None),
+            }
+
+            values = []
+            for h in headers:
+                v = row.get(h, "N/A")
+                if not metrics_available and h in metric_value_headers:
+                    v = "N/A"
+                values.append(clean(v))
+
+            ensure_tsv_schema(tsv_path)
+            with open(tsv_path, "a", encoding="utf-8") as f:
+                f.write("\t".join(values) + "\n")
+
+            readable_block = build_readable_block({headers[i]: values[i] for i in range(len(headers))})
+            prefix = ""
+            if readable_path.exists() and readable_path.stat().st_size > 0:
+                prefix = "\n\n"
+            with open(readable_path, "a", encoding="utf-8") as f:
+                f.write(prefix + readable_block + "\n")
+
+            log(f"Model metrics appended to: {readable_path} (readable), {tsv_path} (tabular)")
+        except Exception as e:
+            log(f"WARNING: could not write model metrics history: {e}")
+
+
+    args = parse_args(argv)
+    # If running as frozen EXE with no args, ensure working directory finds .env
+    try:
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            # Ensure working directory finds .env
+            env_path = find_dotenv(usecwd=True)
+            if not env_path:
+                exe_dir = Path(sys.executable).resolve().parent
+                for candidate in [exe_dir / ".env", exe_dir.parent / ".env", exe_dir.parent.parent / ".env"]:
+                    if candidate.exists():
+                        env_path = str(candidate)
+                        break
+            if env_path:
+                os.chdir(str(Path(env_path).parent))
+    except Exception:
+        pass
+    try:
+        cfg = build_config(args)
+    except Exception as e:
+        log(f"ERROR loading configuration: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 2
+
+    # Surface the driver choice so it is visible in this script's output
+    chosen_driver = pick_driver(cfg.odbc_driver)
+    log(f"Using ODBC driver: {chosen_driver}")
+    log(f"Logs: {log_file}")
+
+    if args.check or args.check_only:
+        log("Running connectivity check...")
+        info = connectivity_info(cfg)
+        log("Connectivity OK")
+        log(f"Driver: {info['driver']}")
+        log(f"Server: {info['server']} | Database: {info['database']}")
+        log(f"User: {info['user']}")
+        log("Version: " + str(info['sqlserver_version']).split("\n")[0])
+        if args.check_only:
+            return 0
+
+    # Build minimal SELECT for ML
+    sql = churn_query(args.top, include_label=True, target=args.target_col)
+    log("Running main query...")
+    _t0 = time.perf_counter()
+    try:
+        df = query_dataframe(cfg, sql)
+    except Exception as e:
+        log(f"ERROR running query: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 3
+    log(f"Query returned {len(df):,} rows in {time.perf_counter()-_t0:.1f}s")
+
+    # Normalize and optionally filter/deduplicate by date
+    import pandas as pd
+    if DATE_COL in df.columns:
+        # Ensure clean string values and treat empties consistently
+        df[DATE_COL] = df[DATE_COL].astype(str).str.strip()
+        df[DATE_COL] = df[DATE_COL].replace({"None": pd.NA, "NaT": pd.NA, "nan": pd.NA, "": pd.NA})
+        if args.as_of:
+            df = df[df[DATE_COL] == args.as_of]
+        if not args.keep_all_rows:
+            # Keep latest non-null as_of_date per customer (yyyy-mm-dd sorts lexicographically by date)
+            df = df.sort_values([DATE_COL], na_position='first').drop_duplicates(subset=[CUSTOMER_ID_COL], keep='last')
+
+    # Keep a dense index so later Series assignments align by row position.
+    df = df.reset_index(drop=True)
+
+    # Train and predict
+    log("Training model and generating predictions...")
+    _t0 = time.perf_counter()
+    try:
+        from pymlchurn.ml import MLConfig, train_and_predict
+        ml_cfg = MLConfig(customer_id_col=CUSTOMER_ID_COL, feature_cols=feature_columns(), target_col=args.target_col, date_col=DATE_COL)
+        pred_df = train_and_predict(df, ml_cfg)
+    except Exception as e:
+        log(f"ERROR during model/predictions: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 4
+    log(f"Model + predictions completed in {time.perf_counter()-_t0:.1f}s")
+    # Determine whether prediction values should be treated as calibrated probabilities
+    # or as proxy risk scores (when true labels are unavailable on this snapshot).
+    model_metrics = getattr(pred_df, "attrs", {}).get("model_metrics", {})
+    evaluation_source = model_metrics.get("evaluation_source") if isinstance(model_metrics, dict) else None
+    train_label_source = model_metrics.get("train_label_source") if isinstance(model_metrics, dict) else None
+    is_proxy_score = (
+        evaluation_source in {"actual_label_unavailable", "actual_label_single_class"}
+        or train_label_source != "target"
+    )
+
+    if is_proxy_score:
+        if "predicted_churn_probability_90d" in pred_df.columns:
+            pred_df["predicted_churn_score_90d"] = pred_df["predicted_churn_probability_90d"]
+        if "predicted_churn_probability_90d_pct" in pred_df.columns:
+            pred_df["predicted_churn_score_90d_pct"] = pred_df["predicted_churn_probability_90d_pct"]
+        pred_df = pred_df.drop(
+            columns=[c for c in ["predicted_churn_probability_90d", "predicted_churn_probability_90d_pct"] if c in pred_df.columns]
+        )
+        pred_df["prediction_value_type"] = "risk_score_proxy"
+        log("Prediction values are emitted as risk scores because calibrated labels are unavailable for this snapshot.")
+    else:
+        pred_df["prediction_value_type"] = "churn_probability_estimate"
+
+    append_model_metrics_history(pred_df, prediction_value_type=("risk_score_proxy" if is_proxy_score else "churn_probability_estimate"))
+
+    # Drop legacy columns if present
+    if "actual_churned_hard90" in pred_df.columns:
+        pred_df = pred_df.drop(columns=["actual_churned_hard90"])
+
+    # Compute business-rule churn at snapshot (t0), aligned to SQL logic.
+    try:
+        churn_flag = pd.to_numeric(df.get("ChurnIf_NoOrd90"), errors="coerce").fillna(0).astype(int)
+        maint_active = pd.to_numeric(df.get("MaintContractActive"), errors="coerce").fillna(0).astype(int)
+        business_churn_now = ((churn_flag == 1) & (maint_active == 0)).astype(int)
+        reasons = []
+        for i in range(len(df)):
+            if maint_active.iloc[i] == 1:
+                reasons.append("Excluded: Active maintenance contract")
+            elif churn_flag.iloc[i] == 1:
+                reasons.append("No qualifying orders in last 90 days (snapshot rule)")
+            else:
+                reasons.append("Not churn by 90-day rule")
+        pred_df["business_churn_now"] = business_churn_now.to_numpy()
+        pred_df["business_churn_reason"] = reasons
+        if "Recency_Orders_Days" in df.columns:
+            pred_df["recency_orders_days_t0"] = pd.to_numeric(
+                df["Recency_Orders_Days"], errors="coerce"
+            ).to_numpy()
+    except Exception:
+        pass
+
+    # (Reverted) no combined statuses or at-risk flags
+
+    # Dynamic prediction value labels/columns.
+    if is_proxy_score:
+        pred_metric_src = "predicted_churn_score_90d"
+        pred_metric_pct_src = "predicted_churn_score_90d_pct"
+        pred_metric_tgt = "predicted_churn_risk_score_90d_t0+90d"
+        pred_metric_pct_tgt = "predicted_churn_risk_score_90d_pct_t0+90d"
+        pred_metric_label = "Churn Risk Score (Next 90 Days)"
+        pred_metric_pct_label = "Churn Risk Score % (Next 90 Days)"
+    else:
+        pred_metric_src = "predicted_churn_probability_90d"
+        pred_metric_pct_src = "predicted_churn_probability_90d_pct"
+        pred_metric_tgt = "predicted_churn_probability_90d_t0+90d"
+        pred_metric_pct_tgt = "predicted_churn_probability_90d_pct_t0+90d"
+        pred_metric_label = "Churn Probability (Next 90 Days)"
+        pred_metric_pct_label = "Churn Probability % (Next 90 Days)"
+
+    # Rename columns to indicate timeframe (_t0 for snapshot, _t0+90d for horizon)
+    rename_map = {
+        DATE_COL: "as_of_date_t0",
+        "actual_churned_90d": "actual_churned_90d_t0+90d",
+        "actual_churn_reason_90d": "actual_churn_reason_t0",
+        "predicted_churn_90d": "predicted_churn_90d_t0+90d",
+        pred_metric_src: pred_metric_tgt,
+        pred_metric_pct_src: pred_metric_pct_tgt,
+        "predicted_churn_reason_90d": "predicted_churn_reason_t0",
+        "business_churn_now": "business_churn_now",
+        "business_churn_reason": "business_churn_reason",
+        "prediction_value_type": "prediction_value_type",
+    }
+    pred_df = pred_df.rename(columns=rename_map)
+
+    # Derive a simple monthly horizon column: predicted churn month for the 90d window
+    try:
+        as_of_ts = pd.to_datetime(pred_df.get("as_of_date_t0"), errors="coerce")
+        churn_month = (as_of_ts + pd.to_timedelta(90, unit="D")).dt.to_period("M").dt.to_timestamp()
+        pred_df["predicted_churn_month_t0+90d"] = churn_month.dt.strftime("%Y-%m-01")
+    except Exception:
+        pass
+    # Apply header style
+    if args.headers == "friendly":
+        friendly_map = {
+            CUSTOMER_ID_COL: "Customer ID",
+            "as_of_date_t0": "Snapshot Date",
+            "recency_orders_days_t0": "Recency Orders Days (Snapshot)",
+            "business_churn_now": "Churned Now (Business Rule)",
+            "business_churn_reason": "Why (Business Rule)",
+            "actual_churned_90d_t0+90d": "Churned Within 90 Days (Actual)",
+            "actual_churn_reason_t0": "Why They Churned (Actual)",
+            "predicted_churn_90d_t0+90d": "Predicted to Churn (Next 90 Days)",
+            pred_metric_tgt: pred_metric_label,
+            pred_metric_pct_tgt: pred_metric_pct_label,
+            "prediction_value_type": "Prediction Value Type",
+            "predicted_churn_reason_t0": "Why At Risk (Predicted)",
+            "predicted_churn_month_t0+90d": "Predicted Churn Month (Next 90 Days)",
+        }
+        pred_df = pred_df.rename(columns=friendly_map)
+
+        cols_pref = [
+            "Customer ID",
+            "Snapshot Date",
+            "Recency Orders Days (Snapshot)",
+            "Churned Now (Business Rule)",
+            "Why (Business Rule)",
+            "Churned Within 90 Days (Actual)",
+            "Why They Churned (Actual)",
+            "Predicted to Churn (Next 90 Days)",
+            pred_metric_pct_label,
+            pred_metric_label,
+            "Prediction Value Type",
+            "Why At Risk (Predicted)",
+            "Predicted Churn Month (Next 90 Days)",
+        ]
+        ordered = [c for c in cols_pref if c in pred_df.columns] + [c for c in pred_df.columns if c not in cols_pref]
+        pred_df = pred_df[ordered]
+    else:
+        # Technical ordering
+        cols_pref = [
+            CUSTOMER_ID_COL,
+            "as_of_date_t0",
+            "recency_orders_days_t0",
+            "business_churn_now",
+            "business_churn_reason",
+            "actual_churned_90d_t0+90d",
+            "actual_churn_reason_t0",
+            "predicted_churn_90d_t0+90d",
+            pred_metric_tgt,
+            pred_metric_pct_tgt,
+            "prediction_value_type",
+            "predicted_churn_reason_t0",
+            "predicted_churn_month_t0+90d",
+        ]
+        ordered = [c for c in cols_pref if c in pred_df.columns] + [c for c in pred_df.columns if c not in cols_pref]
+        pred_df = pred_df[ordered]
+
+    # Append CreatedOn timestamp (local time, seconds precision)
+    try:
+        import pandas as pd  # ensure available here
+        pred_df['CreatedOn'] = pd.Timestamp.now().floor('s')
+    except Exception:
+        pass
+
+    # Rename columns to PascalCase without spaces/underscores/hyphens
+    def to_pascal(name: str) -> str:
+        name = name.replace('%', ' Pct ')
+        tokens = re.findall(r"[A-Za-z0-9]+", name)
+        return "".join(t.capitalize() if not t.isnumeric() else t for t in tokens)
+
+    pred_df = pred_df.rename(columns={c: to_pascal(c) for c in pred_df.columns})
+
+    # Create table and load to SQL
+    log(f"Loading into SQL: [{args.load_schema}].[{args.load_table}] (if_exists={args.load_if_exists})...")
+    _t0 = time.perf_counter()
+    try:
+        fq, dtypes = create_table_if_missing(cfg, pred_df, args.load_schema, args.load_table)
+        load_dataframe(cfg, pred_df, args.load_schema, args.load_table, if_exists=args.load_if_exists)
+        print(f"Loaded {len(pred_df):,} rows into {fq}")
+        log(f"SQL load completed in {time.perf_counter()-_t0:.1f}s")
+    except Exception as e:
+        log(f"ERROR loading to SQL: {e}")
+        if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+            time.sleep(8)
+        return 5
+    if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+        log("Run complete. Closing in 5 seconds...")
+        time.sleep(5)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
