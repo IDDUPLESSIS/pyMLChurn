@@ -33,6 +33,7 @@ from pymlchurn.query import (
     target_column,
 )
 from pymlchurn.load_sql import create_table_if_missing, load_dataframe
+from pymlchurn.risk import interpret_business_risk_frame, validate_recency_consistency
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -673,25 +674,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         artifact_paths=artifact_paths,
     )
 
-    # Attach business-rule snapshot signals to scored rows for downstream comparability.
+    # Attach deterministic business-rule interpretation to scored rows for downstream comparability.
     try:
-        churn_flag = pd.to_numeric(score_df.get("ChurnIf_NoOrd90"), errors="coerce").fillna(0).astype(int)
-        maint_active = pd.to_numeric(score_df.get("MaintContractActive"), errors="coerce").fillna(0).astype(int)
-        business_churn_now = ((churn_flag == 1) & (maint_active == 0)).astype(int)
-        reasons = []
-        for i in range(len(score_df)):
-            if maint_active.iloc[i] == 1:
-                reasons.append("Excluded: Active maintenance contract")
-            elif churn_flag.iloc[i] == 1:
-                reasons.append("No qualifying orders in last 90 days (snapshot rule)")
-            else:
-                reasons.append("Not churn by 90-day rule")
-        pred_df["business_churn_now"] = business_churn_now.to_numpy()
-        pred_df["business_churn_reason"] = reasons
+        business_df = interpret_business_risk_frame(score_df)
+        recency_validation_df = validate_recency_consistency(score_df, snapshot_col=DATE_COL)
+
+        mismatch_mask = recency_validation_df["recency_consistency_flag"].eq("mismatch")
+        if bool(mismatch_mask.any()):
+            mismatch_count = int(mismatch_mask.sum())
+            log(f"WARNING: recency validation flagged {mismatch_count:,} row(s) for investigation.")
+            business_df.loc[mismatch_mask, "business_risk_status"] = "Data Quality Review"
+            business_df.loc[mismatch_mask, "business_risk_explanation"] = (
+                business_df.loc[mismatch_mask, "business_risk_explanation"].astype(str)
+                + " Recency validation mismatch requires investigation."
+            )
+
+        pred_df = pd.concat([pred_df.reset_index(drop=True), business_df.reset_index(drop=True)], axis=1)
+        recency_warning = recency_validation_df["recency_consistency_reason"].where(
+            recency_validation_df["recency_consistency_flag"].isin(["mismatch", "incomplete"]),
+            pd.NA,
+        )
+        pred_df["recency_validation_warning"] = recency_warning.to_numpy()
+        pred_df["recency_validation_status"] = recency_validation_df["recency_consistency_flag"].to_numpy()
         if "Recency_Orders_Days" in score_df.columns:
             pred_df["recency_orders_days_t0"] = pd.to_numeric(score_df["Recency_Orders_Days"], errors="coerce").to_numpy()
-    except Exception:
-        pass
+        if "LastOrderDate" in score_df.columns:
+            pred_df["last_order_date_t0"] = pd.to_datetime(score_df["LastOrderDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+    except Exception as e:
+        log(f"WARNING: business risk interpretation failed: {e}")
 
     if is_proxy_score:
         pred_metric_src = "predicted_churn_score_90d"
@@ -714,9 +724,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         "predicted_churn_reason_90d": "predicted_churn_reason_t0",
         "business_churn_now": "business_churn_now",
         "business_churn_reason": "business_churn_reason",
+        "raw_commercial_inactivity_risk": "raw_commercial_inactivity_risk",
+        "raw_commercial_inactivity_risk_score": "raw_commercial_inactivity_risk_score",
+        "protected_by_maintenance_contract": "protected_by_maintenance_contract",
+        "maintenance_protection_score": "maintenance_protection_score",
+        "adjusted_business_risk_score": "adjusted_business_risk_score",
+        "watchlist_churn_risk": "watchlist_churn_risk",
+        "business_risk_status": "business_risk_status",
+        "business_risk_explanation": "business_risk_explanation",
+        "maintenance_protection_level": "maintenance_protection_level",
+        "raw_business_risk_reasons": "raw_business_risk_reasons",
+        "protection_modifier_reasons": "protection_modifier_reasons",
+        "recency_validation_warning": "recency_validation_warning",
+        "recency_validation_status": "recency_validation_status",
+        "last_order_date_t0": "last_order_date_t0",
         "prediction_value_type": "prediction_value_type",
     }
     pred_df = pred_df.rename(columns=rename_map)
+
+    if pred_metric_tgt in pred_df.columns:
+        pred_df["ml_prediction_score_90d_t0+90d"] = pred_df[pred_metric_tgt]
+    if pred_metric_pct_tgt in pred_df.columns:
+        pred_df["ml_prediction_score_pct_90d_t0+90d"] = pred_df[pred_metric_pct_tgt]
 
     try:
         as_of_ts = pd.to_datetime(pred_df.get("as_of_date_t0"), errors="coerce")
@@ -730,13 +759,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         CUSTOMER_ID_COL,
         "as_of_date_t0",
         "recency_orders_days_t0",
+        "last_order_date_t0",
         "business_churn_now",
         "business_churn_reason",
+        "raw_commercial_inactivity_risk",
+        "raw_commercial_inactivity_risk_score",
+        "protected_by_maintenance_contract",
+        "maintenance_protection_score",
+        "adjusted_business_risk_score",
+        "watchlist_churn_risk",
+        "business_risk_status",
+        "business_risk_explanation",
+        "maintenance_protection_level",
+        "raw_business_risk_reasons",
+        "protection_modifier_reasons",
+        "recency_validation_warning",
+        "recency_validation_status",
         "actual_churned_90d_t0+90d",
         "actual_churn_reason_t0",
         "predicted_churn_90d_t0+90d",
         pred_metric_tgt,
         pred_metric_pct_tgt,
+        "ml_prediction_score_90d_t0+90d",
+        "ml_prediction_score_pct_90d_t0+90d",
         "prediction_value_type",
         "predicted_churn_reason_t0",
         "predicted_churn_month_t0+90d",
@@ -752,6 +797,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         pass
 
     def to_pascal(name: str) -> str:
+        explicit = {
+            CUSTOMER_ID_COL: "CustomerId",
+            "as_of_date_t0": "SnapshotDate",
+            "recency_orders_days_t0": "RecencyOrdersDaysSnapshot",
+            "last_order_date_t0": "LastOrderDate",
+            "business_churn_now": "ChurnedNowBusinessRule",
+            "business_churn_reason": "WhyBusinessRule",
+            "actual_churned_90d_t0+90d": "ChurnedWithin90DaysActual",
+            "actual_churn_reason_t0": "WhyTheyChurnedActual",
+            "predicted_churn_90d_t0+90d": "PredictedToChurnNext90Days",
+            pred_metric_tgt: "ChurnRiskScoreNext90Days",
+            pred_metric_pct_tgt: "ChurnRiskScorePctNext90Days",
+            "ml_prediction_score_90d_t0+90d": "MlPredictionScoreNext90Days",
+            "ml_prediction_score_pct_90d_t0+90d": "MlPredictionScorePctNext90Days",
+            "prediction_value_type": "PredictionValueType",
+            "predicted_churn_reason_t0": "WhyAtRiskPredicted",
+            "predicted_churn_month_t0+90d": "PredictedChurnMonthNext90Days",
+            "raw_commercial_inactivity_risk": "RawCommercialInactivityRisk",
+            "raw_commercial_inactivity_risk_score": "RawCommercialInactivityRiskScore",
+            "protected_by_maintenance_contract": "ProtectedByMaintenanceContract",
+            "maintenance_protection_score": "MaintenanceProtectionScore",
+            "adjusted_business_risk_score": "AdjustedBusinessRiskScore",
+            "watchlist_churn_risk": "WatchlistChurnRisk",
+            "business_risk_status": "BusinessRiskStatus",
+            "business_risk_explanation": "BusinessRiskExplanation",
+            "maintenance_protection_level": "MaintenanceProtectionLevel",
+            "raw_business_risk_reasons": "RawBusinessRiskReasons",
+            "protection_modifier_reasons": "ProtectionModifierReasons",
+            "recency_validation_warning": "RecencyValidationWarning",
+            "recency_validation_status": "RecencyValidationStatus",
+        }
+        if name in explicit:
+            return explicit[name]
         name = name.replace("%", " Pct ")
         tokens = re.findall(r"[A-Za-z0-9]+", name)
         return "".join(t.capitalize() if not t.isnumeric() else t for t in tokens)

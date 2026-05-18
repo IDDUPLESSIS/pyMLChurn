@@ -33,8 +33,8 @@ BEGIN
         --    Labels should be forward-looking (90/180/365 ahead),
         --    and must NOT depend on CustomerChurnEvents.
         ---------------------------------------------------------
-        PRINT 'Step 2: Labelling churn targets (product-only churn rule)...';
-        EXEC chrn01.sp_LabelCustomerSnapshotTargets_ProductOnly;
+        PRINT 'Step 2: Labelling churn targets...';
+        EXEC chrn01.sp_LabelCustomerSnapshotTargets;
         PRINT 'Step 2: Target labelling completed.';
 
         ---------------------------------------------------------

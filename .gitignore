@@ -19,3 +19,11 @@ build/
 
 # Data outputs
 *.csv
+pyMLChurn_model_metrics_history.*
+pyMLChurn_run_*.log
+
+# Local AI/export scratch folders
+ChatGPT/
+
+# Local IDE/project files
+ide/

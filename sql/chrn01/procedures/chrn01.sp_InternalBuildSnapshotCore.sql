@@ -333,6 +333,7 @@ BEGIN
         @SnapshotDate AS SnapshotDate,
         c.CustomerId,
 
+        fo.LastOrderDate,
         fo.Recency_Orders_Days,
         fo.Recency_MaintOrders_Days,
         fi.Recency_Invoices_Days,
@@ -430,11 +431,11 @@ BEGIN
         0 AS UpcomingChurn_90d,
         0 AS KnownChurn_Confirmed,
 
-        -- churn definition heuristic: no orders >90 AND no active maintenance contract
+        -- raw churn-inactivity signal: no orders >90.
+        -- Maintenance is interpreted downstream as a protection modifier, not a veto.
         CASE
             WHEN fo.Recency_Orders_Days IS NOT NULL
              AND fo.Recency_Orders_Days > 90
-             AND ISNULL(mc.MaintContractActive,0) = 0
             THEN 1 ELSE 0
         END AS ChurnIf_NoOrd90,
 
@@ -497,6 +498,7 @@ BEGIN
         SnapshotDate,
         CustomerId,
 
+        LastOrderDate,
         Recency_Orders_Days,
         Recency_MaintOrders_Days,
         Recency_Invoices_Days,
@@ -571,6 +573,7 @@ BEGIN
         SnapshotDate,
         CustomerId,
 
+        LastOrderDate,
         Recency_Orders_Days,
         Recency_MaintOrders_Days,
         Recency_Invoices_Days,

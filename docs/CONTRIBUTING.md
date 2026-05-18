@@ -30,8 +30,9 @@ Executable (optional)
 Coding guidelines
 - Keep changes focused and minimal
 - Match existing style and naming
-- Favor friendly headers for user-facing outputs; technical headers remain available
-- Avoid committing generated artifacts (`*.csv`, `dist/`, `build/`, `.venv_build/`)
+- Keep ML scoring, raw business-rule risk, maintenance protection, adjusted business risk, and final business status separate
+- Preserve legacy output columns when adding reporting fields
+- Avoid committing generated artifacts (`*.csv`, `*.log`, `dist/`, `build/`, `.venv_build/`, model metrics history)
 
 Submitting changes
 1) Create a feature branch: `git checkout -b feature/my-change`

@@ -11,6 +11,7 @@ AS
 SELECT
     s.SnapshotDate,
     s.CustomerId,
+    s.LastOrderDate,
 
     ----------------------------------------------------------------
     -- 1) Recency + basic 90d windows (core churn signal = no product buys)
@@ -37,8 +38,9 @@ SELECT
     s.IsMaintHeavy_90d,
 
     ----------------------------------------------------------------
-    -- 1b) Active maintenance contract exclusion feature
-    -- If 1, we should NOT treat "no product buys" as churn in your definition.
+    -- 1b) Active maintenance contract protection feature
+    -- If 1, maintenance can reduce interpreted risk severity but should not
+    -- hide raw commercial inactivity signals.
     ----------------------------------------------------------------
     s.MaintContractActive,
 
@@ -103,8 +105,8 @@ SELECT
 
     ----------------------------------------------------------------
     -- 5) Labels (forward-looking targets already stored on CustomerSnapshot)
-    -- Your company definition: "no PRODUCT purchases in last 90 days"
-    -- with exclusion: "if active maintenance contract, do not mark churn"
+    -- Maintenance protection is modeled as context/modifier, not a hard veto
+    -- against raw commercial inactivity visibility.
     ----------------------------------------------------------------
     s.Target_IsChurned_3mAhead  AS Label_Churn_90d,
     s.Target_IsChurned_6mAhead  AS Label_Churn_180d,

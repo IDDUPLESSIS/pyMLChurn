@@ -52,13 +52,26 @@ def _map_dtypes(df: pd.DataFrame) -> Tuple[Dict[str, sa.types.TypeEngine], Dict[
         if key in {"customerid", "customer_id", "customer id"} or sc.lower() in {"customer_id", "customerid"}:
             dtypes[sc] = sa.types.NVARCHAR(length=255)
             continue
-        if "snapshotdate" in key or sc.lower() == "snapshot_date":
+        if "snapshotdate" in key or "lastorderdate" in key or sc.lower() in {"snapshot_date", "last_order_date"}:
             dtypes[sc] = sa.Date()
             continue
         if "dayssincelastpurchase" in key:
             dtypes[sc] = sa.Integer()
             continue
-        if any(x in key for x in ["churnednow","predictedtochurn","actualchurned"]):
+        if "score" in key:
+            dtypes[sc] = sa.Float()
+            continue
+        if any(
+            x in key
+            for x in [
+                "churnednow",
+                "predictedtochurn",
+                "actualchurned",
+                "rawcommercialinactivityrisk",
+                "protectedbymaintenancecontract",
+                "watchlistchurnrisk",
+            ]
+        ):
             dtypes[sc] = sa.Boolean()
             continue
         if "probabilitypct" in key:

@@ -24,11 +24,28 @@ WITH base AS (
         ) AS [ChildExternalId],
 
         ccp.[SnapshotDate],
-        ro.[LastOrderDate],
+        ccp.[RecencyOrdersDaysSnapshot],
+        COALESCE(ccp.[LastOrderDate], ro.[LastOrderDate]) AS [LastOrderDate],
         ccp.[ChurnedNowBusinessRule],
         ccp.[WhyBusinessRule],
+        ccp.[RawCommercialInactivityRisk],
+        ccp.[RawCommercialInactivityRiskScore],
+        ccp.[ProtectedByMaintenanceContract],
+        ccp.[MaintenanceProtectionScore],
+        ccp.[AdjustedBusinessRiskScore],
+        ccp.[WatchlistChurnRisk],
+        ccp.[BusinessRiskStatus],
+        ccp.[BusinessRiskExplanation],
+        ccp.[MaintenanceProtectionLevel],
+        ccp.[RawBusinessRiskReasons],
+        ccp.[ProtectionModifierReasons],
+        ccp.[RecencyValidationWarning],
+        ccp.[RecencyValidationStatus],
         ccp.[PredictedToChurnNext90Days],
         ccp.[ChurnRiskScoreNext90Days],
+        ccp.[MlPredictionScoreNext90Days],
+        ccp.[MlPredictionScorePctNext90Days],
+        ccp.[PredictionValueType],
         ccp.[WhyAtRiskPredicted],
         ccp.[PredictedChurnMonthNext90Days]
 
@@ -70,39 +87,54 @@ calc AS (
             )
         END AS LastOrderLabel,
 
-        -- ProbPct: if 0..1 => *100 else keep
+        -- ProbPct: business-facing adjusted risk, if 0..1 => *100 else keep
         CASE
-            WHEN b.[ChurnRiskScoreNext90Days] IS NULL THEN NULL
-            WHEN TRY_CONVERT(float, b.[ChurnRiskScoreNext90Days]) <= 1
-                THEN TRY_CONVERT(float, b.[ChurnRiskScoreNext90Days]) * 100.0
-            ELSE TRY_CONVERT(float, b.[ChurnRiskScoreNext90Days])
+            WHEN b.[AdjustedBusinessRiskScore] IS NULL THEN NULL
+            WHEN TRY_CONVERT(float, b.[AdjustedBusinessRiskScore]) <= 1
+                THEN TRY_CONVERT(float, b.[AdjustedBusinessRiskScore]) * 100.0
+            ELSE TRY_CONVERT(float, b.[AdjustedBusinessRiskScore])
         END AS ProbPct,
 
-        -- RiskSort: YES first (0), then NO (1)
+        -- RiskSort: business status severity first
         CASE
-            WHEN LOWER(LTRIM(RTRIM(CAST(b.PredictedToChurnNext90Days AS varchar(20))))) IN ('1','true','y','yes') THEN 0
-            WHEN LOWER(LTRIM(RTRIM(CAST(b.PredictedToChurnNext90Days AS varchar(20))))) IN ('0','false','n','no') THEN 1
-            ELSE 2
+            WHEN b.[BusinessRiskStatus] = 'Churned' THEN 0
+            WHEN b.[BusinessRiskStatus] = 'Churn Risk' THEN 1
+            WHEN b.[BusinessRiskStatus] = 'Protected But At Risk' THEN 2
+            WHEN b.[BusinessRiskStatus] = 'Watchlist Risk' THEN 3
+            WHEN b.[BusinessRiskStatus] = 'Data Quality Review' THEN 4
+            WHEN b.[BusinessRiskStatus] = 'Protected' THEN 5
+            WHEN b.[BusinessRiskStatus] = 'Healthy' THEN 6
+            ELSE 7
         END AS RiskSort,
 
-        -- ProbSort: higher prob first
+        -- ProbSort: higher adjusted business risk first
         CASE
-            WHEN b.[ChurnRiskScoreNext90Days] IS NULL THEN -1
-            WHEN TRY_CONVERT(float, b.[ChurnRiskScoreNext90Days]) <= 1
-                THEN TRY_CONVERT(float, b.[ChurnRiskScoreNext90Days]) * 100.0
-            ELSE TRY_CONVERT(float, b.[ChurnRiskScoreNext90Days])
+            WHEN b.[AdjustedBusinessRiskScore] IS NULL THEN -1
+            WHEN TRY_CONVERT(float, b.[AdjustedBusinessRiskScore]) <= 1
+                THEN TRY_CONVERT(float, b.[AdjustedBusinessRiskScore]) * 100.0
+            ELSE TRY_CONVERT(float, b.[AdjustedBusinessRiskScore])
         END AS ProbSort,
 
-        -- Risk pill HTML (same as Node)
+        -- Business risk status pill HTML
         CASE
-            WHEN LOWER(LTRIM(RTRIM(CAST(b.PredictedToChurnNext90Days AS varchar(20))))) IN ('1','true','y','yes') THEN
-                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">YES</span>'
-            WHEN LOWER(LTRIM(RTRIM(CAST(b.PredictedToChurnNext90Days AS varchar(20))))) IN ('0','false','n','no') THEN
-                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#dcfce7;color:#166534;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">NO</span>'
+            WHEN b.[BusinessRiskStatus] = 'Churned' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#7f1d1d;color:#fff;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">CHURNED</span>'
+            WHEN b.[BusinessRiskStatus] = 'Churn Risk' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#fee2e2;color:#991b1b;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">CHURN RISK</span>'
+            WHEN b.[BusinessRiskStatus] = 'Protected But At Risk' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#ffedd5;color:#9a3412;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">PROTECTED RISK</span>'
+            WHEN b.[BusinessRiskStatus] = 'Watchlist Risk' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#fef3c7;color:#92400e;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">WATCHLIST</span>'
+            WHEN b.[BusinessRiskStatus] = 'Data Quality Review' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#e0e7ff;color:#3730a3;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">DATA REVIEW</span>'
+            WHEN b.[BusinessRiskStatus] = 'Protected' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">PROTECTED</span>'
+            WHEN b.[BusinessRiskStatus] = 'Healthy' THEN
+                '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#dcfce7;color:#166534;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">HEALTHY</span>'
             ELSE
                 CONCAT(
                     '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:#e5e7eb;color:#374151;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:12px;">',
-                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(CAST(b.PredictedToChurnNext90Days AS varchar(200)),''),'&','&amp;'),'<','&lt;'),'>','&gt;'),'"','&quot;'),'''','&#39;'),
+                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(CAST(b.BusinessRiskStatus AS varchar(200)),''),'&','&amp;'),'<','&lt;'),'>','&gt;'),'"','&quot;'),'''','&#39;'),
                     '</span>'
                 )
         END AS RiskPillHtml
@@ -112,7 +144,7 @@ prob AS (
     SELECT
         c.*,
 
-        -- Probability bar HTML (same thresholds as Node)
+        -- Adjusted business risk bar HTML
         CASE
             WHEN c.ProbPct IS NULL THEN '<span style="color:#666;font-family:Arial,Helvetica,sans-serif;">—</span>'
             ELSE
@@ -141,9 +173,14 @@ drivers AS (
     SELECT
         p.*,
 
-        -- Drivers HTML (bullet lines, max 6, +N more) like Node
+        -- Business drivers HTML (bullet lines, max 6, +N more)
         CASE
-            WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.WhyAtRiskPredicted,''))), '') IS NULL THEN
+            WHEN NULLIF(LTRIM(RTRIM(CONCAT(
+                    COALESCE(p.BusinessRiskExplanation,''),
+                    CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.RawBusinessRiskReasons,''))), '') IS NULL THEN '' ELSE '; ' + p.RawBusinessRiskReasons END,
+                    CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.ProtectionModifierReasons,''))), '') IS NULL THEN '' ELSE '; ' + p.ProtectionModifierReasons END,
+                    CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.RecencyValidationWarning,''))), '') IS NULL THEN '' ELSE '; ' + p.RecencyValidationWarning END
+                ))), '') IS NULL THEN
                 '<span style="color:#666;font-family:Arial,Helvetica,sans-serif;">—</span>'
             ELSE
             (
@@ -163,7 +200,12 @@ drivers AS (
                     FROM OPENJSON(
                         '["' + REPLACE(
                             REPLACE(
-                                REPLACE(p.WhyAtRiskPredicted, '\', '\\'),
+                                REPLACE(CONCAT(
+                                    COALESCE(p.BusinessRiskExplanation,''),
+                                    CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.RawBusinessRiskReasons,''))), '') IS NULL THEN '' ELSE '; ' + p.RawBusinessRiskReasons END,
+                                    CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.ProtectionModifierReasons,''))), '') IS NULL THEN '' ELSE '; ' + p.ProtectionModifierReasons END,
+                                    CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.RecencyValidationWarning,''))), '') IS NULL THEN '' ELSE '; ' + p.RecencyValidationWarning END
+                                ), '\', '\\'),
                             '"', '\"'),
                         ';', '","') + '"]'
                     )
@@ -184,7 +226,12 @@ drivers AS (
                         FROM OPENJSON(
                             '["' + REPLACE(
                                 REPLACE(
-                                    REPLACE(p.WhyAtRiskPredicted, '\', '\\'),
+                                    REPLACE(CONCAT(
+                                        COALESCE(p.BusinessRiskExplanation,''),
+                                        CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.RawBusinessRiskReasons,''))), '') IS NULL THEN '' ELSE '; ' + p.RawBusinessRiskReasons END,
+                                        CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.ProtectionModifierReasons,''))), '') IS NULL THEN '' ELSE '; ' + p.ProtectionModifierReasons END,
+                                        CASE WHEN NULLIF(LTRIM(RTRIM(COALESCE(p.RecencyValidationWarning,''))), '') IS NULL THEN '' ELSE '; ' + p.RecencyValidationWarning END
+                                    ), '\', '\\'),
                                 '"', '\"'),
                             ';', '","') + '"]'
                         )
@@ -201,24 +248,24 @@ final AS (
         d.*,
 
         COUNT(*) OVER (PARTITION BY d.Domain) AS TotalRows,
-        SUM(CASE WHEN d.RiskSort = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY d.Domain) AS RiskCount,
+        SUM(CASE WHEN d.WatchlistChurnRisk = 1 OR d.BusinessRiskStatus IN ('Churned','Churn Risk','Protected But At Risk','Watchlist Risk') THEN 1 ELSE 0 END) OVER (PARTITION BY d.Domain) AS RiskCount,
         AVG(CASE WHEN d.ProbPct IS NULL THEN NULL ELSE d.ProbPct END) OVER (PARTITION BY d.Domain) AS AvgProbPct
     FROM drivers d
 )
 SELECT
     f.*,
 
-    -- Takeaway sentence exactly like Node
+    -- Business risk takeaway sentence
     CASE
         WHEN f.TotalRows = 0 THEN 'No churn prediction rows returned.'
         ELSE CONCAT(
             '<strong>', CAST(f.RiskCount AS varchar(10)),
             ' of ', CAST(f.TotalRows AS varchar(10)),
             ' customers (', CAST(CAST(ROUND(100.0 * f.RiskCount / NULLIF(f.TotalRows,0), 0) AS int) AS varchar(10)),
-            '%)</strong> are predicted to churn in the next 90 days',
+            '%)</strong> are watchlist, churn-risk, or churned customers',
             CASE
                 WHEN f.AvgProbPct IS NULL THEN ''
-                ELSE CONCAT(', with an average confidence of <strong>', CAST(CAST(ROUND(f.AvgProbPct,0) AS int) AS varchar(10)), '%</strong>')
+                ELSE CONCAT(', with an average adjusted business risk of <strong>', CAST(CAST(ROUND(f.AvgProbPct,0) AS int) AS varchar(10)), '%</strong>')
             END,
             '.'
         )

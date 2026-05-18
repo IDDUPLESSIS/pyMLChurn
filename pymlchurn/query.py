@@ -97,11 +97,17 @@ def _top_clause(top: Optional[int]) -> str:
     return f"TOP ({int(top)}) " if (top is not None and int(top) > 0) else ""
 
 
-def _shared_select_columns(target: Optional[str] = None, include_target: bool = False) -> List[str]:
+def _shared_select_columns(
+    target: Optional[str] = None,
+    include_target: bool = False,
+    include_metadata: bool = False,
+) -> List[str]:
     cols: List[str] = [
         f"[{CUSTOMER_ID_COL}]",
         "CONVERT(varchar(10), [SnapshotDate], 23) AS [as_of_date]",
     ]
+    if include_metadata:
+        cols.append("CONVERT(varchar(10), [LastOrderDate], 23) AS [LastOrderDate]")
     cols.extend([f"[{c}]" for c in feature_columns()])
     if include_target:
         cols.append(f"[{target or target_column()}]")
@@ -136,7 +142,7 @@ def churn_scoring_query(
     score_as_of: Optional[str] = None,
     top: Optional[int] = None,
 ) -> str:
-    select_cols = ",\n      ".join(_shared_select_columns(include_target=False))
+    select_cols = ",\n      ".join(_shared_select_columns(include_target=False, include_metadata=True))
     if score_as_of:
         score_expr = f"CAST('{_safe_sql_date_literal(score_as_of)}' AS date)"
     else:

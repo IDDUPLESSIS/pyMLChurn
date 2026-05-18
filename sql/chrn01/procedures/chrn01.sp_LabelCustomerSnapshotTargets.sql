@@ -17,7 +17,7 @@ BEGIN
     DECLARE @MaxLabelDate_180 date = DATEADD(DAY, -180, @Today);
     DECLARE @MaxLabelDate_365 date = DATEADD(DAY, -365, @Today);
 
-    PRINT 'Labelling churn targets (3m, 6m, 12m) using sustained inactivity + maintenance protection + forward recovery logic...';
+    PRINT 'Labelling churn targets (3m, 6m, 12m) using sustained inactivity + forward recovery logic; maintenance is a modifier, not a veto...';
     PRINT CONCAT(
         'Today=', CONVERT(varchar(10), @Today, 120),
         ' | MaxLabelDate90=',  CONVERT(varchar(10), @MaxLabelDate_90, 120),
@@ -34,10 +34,7 @@ BEGIN
            - no qualifying PRODUCT invoice activity in the prior H days, including SnapshotDate
              window = (SnapshotDate - H, SnapshotDate]
 
-        2) Not protected by maintenance at t0:
-           - MaintContractActive = 0 on CustomerSnapshot
-
-        3) No recovery after t0:
+        2) No recovery after t0:
            - no qualifying PRODUCT invoice activity in the forward H days
              window = (SnapshotDate, SnapshotDate + H]
            - and no MAINTENANCE renewal / recovery in the forward H days
@@ -47,6 +44,8 @@ BEGIN
         -----
         - PRODUCT activity is inferred from ZSD_REPBILL rows where Sales Doc length = 6,
           non-cancelled, non-return, positive net value.
+        - Active maintenance at t0 remains available as a protection modifier and
+          reporting context, but it no longer erases raw inactivity risk.
         - MAINTENANCE recovery is inferred from ZSD_REPORD_ORDER_INTAKE rows where
           Order Number length = 8, company US01, not rejected, document date in forward window,
           and Contract Item End Date extends beyond SnapshotDate.
@@ -329,7 +328,6 @@ BEGIN
             CASE
                 WHEN l.SnapshotDate > @MaxLabelDate_90 THEN NULL
                 WHEN l.Target_Inactive_NoOrders_90d = 1
-                 AND l.Target_MaintProtected_T0_90d = 0
                  AND (CASE WHEN l.Target_Recovered_ByOrder_90d = 1 OR l.Target_Recovered_ByMaint_90d = 1 THEN 1 ELSE 0 END) = 0
                 THEN 1
                 ELSE 0
@@ -338,7 +336,6 @@ BEGIN
             CASE
                 WHEN l.SnapshotDate > @MaxLabelDate_180 THEN NULL
                 WHEN l.Target_Inactive_NoOrders_180d = 1
-                 AND l.Target_MaintProtected_T0_180d = 0
                  AND (CASE WHEN l.Target_Recovered_ByOrder_180d = 1 OR l.Target_Recovered_ByMaint_180d = 1 THEN 1 ELSE 0 END) = 0
                 THEN 1
                 ELSE 0
@@ -347,7 +344,6 @@ BEGIN
             CASE
                 WHEN l.SnapshotDate > @MaxLabelDate_365 THEN NULL
                 WHEN l.Target_Inactive_NoOrders_365d = 1
-                 AND l.Target_MaintProtected_T0_365d = 0
                  AND (CASE WHEN l.Target_Recovered_ByOrder_365d = 1 OR l.Target_Recovered_ByMaint_365d = 1 THEN 1 ELSE 0 END) = 0
                 THEN 1
                 ELSE 0

@@ -4,6 +4,7 @@ CREATE TABLE [chrn01].[CustomerSnapshot]
 (
     [SnapshotDate] date NOT NULL,
     [CustomerId] nvarchar(255) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,
+    [LastOrderDate] date NULL,
     [Recency_Orders_Days] int NULL,
     [Recency_MaintOrders_Days] int NULL,
     [Recency_Invoices_Days] int NULL,
